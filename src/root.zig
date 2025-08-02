@@ -1,21 +1,12 @@
 const std = @import("std");
-const assert = std.debug.assert;
-const builtin = @import("builtin");
-const exit = std.os.linux.exit;
 const mem = std.mem;
+const meta = std.meta;
 const process = std.process;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
 const ArgIterator = process.ArgIterator;
-const ArgIteratorGeneral = process.ArgIteratorGeneral;
-const Allocator = std.mem.Allocator;
+const Allocator = mem.Allocator;
 const StructField = std.builtin.Type.StructField;
-
-pub const ArgOptions = struct {
-    short: ?[]const u8 = null,
-    long: ?[]const u8 = null,
-    description: ?[]const u8 = null,
-};
 
 pub fn Arg(comptime T: anytype) type {
     return struct {
@@ -43,6 +34,7 @@ pub fn Args(A: anytype) type {
         header: []const u8 = std.fmt.comptimePrint("Usage: {s} [options]", .{@typeName(A)}),
         arena: ArenaAllocator,
         writer: ?std.io.AnyWriter = null,
+        token: ?[]const u8 = null,
 
         pub fn init(allocator: Allocator) Self {
             return .{
@@ -50,14 +42,14 @@ pub fn Args(A: anytype) type {
             };
         }
 
-        pub fn parse(self: *Self) !ReturnType {
+        pub fn parse(self: *Self) !ArgStruct {
             var iter = try ArgIterator.initWithAllocator(self.arena.allocator());
             defer iter.deinit();
             _ = iter.skip(); // skip the program name
             return try self.parseWithIterator(&iter);
         }
 
-        const ReturnType = ret: {
+        const ArgStruct = ret: {
             const struct_info = @typeInfo(A);
             const in_fields = struct_info.@"struct".fields;
             var fields: [in_fields.len]StructField = undefined;
@@ -82,17 +74,16 @@ pub fn Args(A: anytype) type {
             });
         };
 
-        pub fn parseWithIterator(self: *Self, iter: anytype) anyerror!ReturnType {
+        pub fn parseWithIterator(self: *Self, iter: anytype) !ArgStruct {
             if (!@hasDecl(@TypeOf(iter.*), "next"))
                 @compileError("Iterator must implement next");
 
-            var args: ReturnType = .{};
-            var continue_token: ?[]const u8 = null;
+            var args: ArgStruct = .{};
             const fields = @typeInfo(A).@"struct".fields;
             loop: while (true) {
                 const current_token = token: {
-                    if (continue_token) |t| {
-                        continue_token = null;
+                    if (self.token) |t| {
+                        self.token = null;
                         break :token t;
                     } else if (iter.next()) |t| break :token t else break :loop;
                 };
@@ -101,56 +92,74 @@ pub fn Args(A: anytype) type {
                     const arg_info = f.defaultValue().?;
                     const InnerType: type = arg_info.type;
                     if (arg_info.eql(f.name, current_token)) {
-                        @field(args, f.name) = switch (InnerType) {
-                            bool, ?bool => true,
-                            []const u8 => iter.next() orelse return error.MissingArgument,
-                            String => .{ .inner = iter.next() orelse return error.MissingArgument },
-                            []u8 => try self.readIntSlices(u8, iter, &continue_token),
-                            []String => try self.readStringSlices(iter, &continue_token),
-                            else => |t| {
-                                std.debug.print("Invalued argument: {s} is type {s}\n", .{current_token, @typeName(t)});
-                                return error.InvalidArgument;
-                            }
-                        };
+                        @field(args, f.name) = try self.readType(InnerType, null, iter);
                     }
                 }
             }
             return args;
         }
 
-        fn readIntSlices(
-            self: *Self,
-            comptime T: type,
-            iter: anytype,
-            continue_token: *?[]const u8,
-        ) anyerror![]T {
-            var list = ArrayList(T).init(self.arena.allocator());
-            while (iter.next()) |token| {
-                if (token[0] == '-') {
-                    continue_token.* = token;
-                    break;
-                }
-                const value = try std.fmt.parseInt(T, token, 0);
-                try list.append(value);
-            }
-            return try list.toOwnedSlice();
-        }
+        fn readType(self: *Self, comptime T: anytype, token: ?[]const u8, iter: anytype) !T {
+            return switch (@typeInfo(T)) {
+                .type,
+                .void,
+                .noreturn
+                    => @compileError("argument of type: " ++ @typeName(T) ++ " not supported"),
+                .@"bool" => true,
+                .int => std.fmt.parseInt(T, token orelse iter.next() orelse return error.InvalidArgument, 0),
+                // int: Int,
+                // float: Float,
+                .pointer => |ptr_info| switch (ptr_info.size) {
+                    .slice => slice: {
+                        const CT = ptr_info.child;
+                        var list = ArrayList(CT).init(self.arena.allocator());
+                        while (iter.next()) |t| {
+                            if (t[0] == '-') {
+                                self.token = t;
+                                break;
+                            }
+                            const value = try self.readType(CT, t, iter);
+                            try list.append(value);
+                        }
+                        break :slice try list.toOwnedSlice();
+                    },
+                    .one,
+                    .many,
+                    .c => @compileError("only slice ptr types are supported")
+                },
+                // array: Array,
+                .@"struct" => |struct_info| strct: {
+                    _ = struct_info;
+                    if (T == String) {
+                        break :strct .{ .inner = token orelse iter.next() orelse return error.MissingArgument };
+                    }
+                },
+                // comptime_float: void,
+                // comptime_int: void,
+                // undefined: void,
+                // null: void,
 
-        fn readStringSlices(
-            self: *Self,
-            iter: anytype,
-            continue_token: *?[]const u8,
-        ) anyerror![]String {
-            var list = ArrayList(String).init(self.arena.allocator());
-            while (iter.next()) |token| {
-                if (token[0] == '-') {
-                    continue_token.* = token;
-                    break;
+                .optional => |op| op: {
+                    const ret: T = try self.readType(op.child, token, iter);
+                    break :op ret;
+                },
+
+                // error_union: ErrorUnion,
+                // error_set: ErrorSet,
+                .@"enum" => meta.stringToEnum(T, token orelse iter.next() orelse "")
+                    orelse return error.InvalidEnum,
+                // @"union": Union,
+                // @"fn": Fn,
+                // @"opaque": Opaque,
+                // frame: Frame,
+                // @"anyframe": AnyFrame,
+                // vector: Vector,
+                // enum_literal: void,
+                else => |t| {
+                    std.debug.print("Invalued argument: {s} is type {s}\n", .{self.token, @typeName(t)});
+                    return error.InvalidArgument;
                 }
-                const value = String{ .inner = token };
-                try list.append(value);
-            }
-            return try list.toOwnedSlice();
+            };
         }
 
         pub fn printHelp(self: *Self) !void {
@@ -219,9 +228,20 @@ pub const String = struct {
 
 test Args {
     const allocator = std.testing.allocator;
+    const TestEnum = enum {
+        less,
+        more,
+        eq,
+    };
+
     const TestArgs = struct {
-        flag: Arg(?bool) = .{ .description = "A simple flag" },
-        value: Arg(String) = .{ .description = "Configuration file" },
+        flag: Arg(bool) = .{ .description = "A flag" },
+        value: Arg(String) = .{ .description = "a string file" },
+        num: Arg(?u32) = .{ .description = "a number" },
+        variant: Arg(TestEnum) = .{
+            .short = "-o",
+            .description = "A enum"
+        },
         multivalue: Arg([]u8) = .{
             .long = "--nums",
             .description = "Multiple values",
@@ -234,27 +254,45 @@ test Args {
 
     const tests = [_]struct {
         args: []const u8,
-        expected: struct { ?bool, ?[]const u8, ?[]const u8, ?[]const String},
+        expected: struct { ?bool, ?u32, ?[]const u8, ?TestEnum, ?[]const u8, ?[]const String},
     }{
         .{
             .args = "-v config.zig",
-            .expected = .{ null, "config.zig", null, null },
+            .expected = .{ false, null, "config.zig", null, null, null },
         },
         .{
             .args = "-v config.zig --flag",
-            .expected = .{ true, "config.zig", null, null },
+            .expected = .{ true, null, "config.zig", null, null, null },
+        },
+        .{
+            .args = "--num 2147483648",
+            .expected = .{ false, 2147483648, null, null, null, null },
+        },
+        .{
+            .args = "-o less",
+            .expected = .{ false, null, null, .less, null, null },
+        },
+        .{
+            .args = "-o more",
+            .expected = .{ false, null, null, .more, null, null },
         },
         .{
             .args = "--nums 1 2 3 --flag",
-            .expected = .{ true, null, &[_]u8{1, 2, 3}, null },
+            .expected = .{ true, null, null, null, &[_]u8{1, 2, 3}, null },
         },
         .{
             .args = "-v config.zig --nums 1 2 3 --flag",
-            .expected = .{ true, "config.zig", &[_]u8{1, 2, 3}, null },
+            .expected = .{ true, null, "config.zig", null, &[_]u8{1, 2, 3}, null },
         },
         .{
             .args = "--entries one two three",
-            .expected = .{ null, null, null, &[_]String{
+            .expected = .{ false, null, null, null, null, &[_]String{
+                .{ .inner = "one" }, .{ .inner = "two" }, .{ .inner = "three" }
+            }},
+        },
+        .{
+            .args = "--flag -v config.zig -n 1 -o eq --nums 4 3 2 1 --entries one two three",
+            .expected = .{ true, 1, "config.zig", .eq, &[_]u8{4, 3, 2, 1}, &[_]String{
                 .{ .inner = "one" }, .{ .inner = "two" }, .{ .inner = "three" }
             }},
         },
@@ -262,7 +300,7 @@ test Args {
 
 
     for (tests) |t| {
-        var iter = try std.process.ArgIteratorGeneral(.{}).init(allocator, t.args);
+        var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
         defer iter.deinit();
 
         var argz = Args(TestArgs).init(allocator);
@@ -270,12 +308,18 @@ test Args {
         const args = try argz.parseWithIterator(&iter);
 
         const flag = t.expected.@"0";
-        const value = t.expected.@"1" orelse "";
-        const multivalue = t.expected.@"2" orelse &[_]u8{};
-        const multistring = t.expected.@"3" orelse &[_]String{};
-        try std.testing.expectEqualStrings(value, args.value.inner);
         try std.testing.expectEqual(flag, args.flag);
+
+        const num = t.expected.@"1";
+        try std.testing.expectEqual(num, args.num);
+
+        const value = t.expected.@"2" orelse "";
+        try std.testing.expectEqualStrings(value, args.value.inner);
+
+        const multivalue = t.expected.@"4" orelse &[_]u8{};
         try std.testing.expectEqualSlices(u8, multivalue, args.multivalue);
+
+        const multistring = t.expected.@"5" orelse &[_]String{};
         try std.testing.expectEqualDeep(multistring, args.multistring);
     }
 }
@@ -283,7 +327,7 @@ test Args {
 test "help text" {
     const allocator = std.testing.allocator;
     const TestArgs = struct {
-        flag: Arg(?bool) = .{ .description = "A simple flag" },
+        flag: Arg(bool) = .{ .description = "A simple flag" },
         value: Arg(String) = .{ .description = "Configuration file" },
         multivalue: Arg([]u8) = .{
             .long = "--nums",
@@ -309,7 +353,7 @@ test "help text" {
         \\Usage: root.test.help text.TestArgs [options]
         \\
         \\Options:
-        \\    -f, --flag     <?bool>          A simple flag
+        \\    -f, --flag     <bool>           A simple flag
         \\    -v, --value    <root.String>    Configuration file
         \\    -m, --nums     <[]u8>           Multiple values
         \\    -m, --entries  <[]root.String>  Multiple strings
