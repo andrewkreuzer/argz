@@ -42,13 +42,6 @@ pub fn Args(A: anytype) type {
             };
         }
 
-        pub fn parse(self: *Self) !ArgStruct {
-            var iter = try ArgIterator.initWithAllocator(self.arena.allocator());
-            defer iter.deinit();
-            _ = iter.skip(); // skip the program name
-            return try self.parseWithIterator(&iter);
-        }
-
         const ArgStruct = ret: {
             const struct_info = @typeInfo(A);
             const in_fields = struct_info.@"struct".fields;
@@ -73,6 +66,13 @@ pub fn Args(A: anytype) type {
                 }
             });
         };
+
+        pub fn parse(self: *Self) !ArgStruct {
+            var iter = try ArgIterator.initWithAllocator(self.arena.allocator());
+            defer iter.deinit();
+            _ = iter.skip(); // skip the program name
+            return try self.parseWithIterator(&iter);
+        }
 
         pub fn parseWithIterator(self: *Self, iter: anytype) !ArgStruct {
             if (!@hasDecl(@TypeOf(iter.*), "next"))
@@ -107,8 +107,7 @@ pub fn Args(A: anytype) type {
                     => @compileError("argument of type: " ++ @typeName(T) ++ " not supported"),
                 .@"bool" => true,
                 .int => std.fmt.parseInt(T, token orelse iter.next() orelse return error.InvalidArgument, 0),
-                // int: Int,
-                // float: Float,
+                .float => std.fmt.parseFloat(T, token orelse iter.next() orelse return error.InvalidArgument),
                 .pointer => |ptr_info| switch (ptr_info.size) {
                     .slice => slice: {
                         const CT = ptr_info.child;
@@ -127,38 +126,47 @@ pub fn Args(A: anytype) type {
                     .many,
                     .c => @compileError("only slice ptr types are supported")
                 },
-                // array: Array,
+                .array => |array_info| array: {
+                    const CT = array_info.child;
+                    var list: T = undefined;
+                    var i: usize = 0;
+                    while (iter.next()) |t| : (i += 1) {
+                        if (t[0] == '-') {
+                            self.token = t;
+                            break;
+                        }
+                        const value = try self.readType(CT, t, iter);
+                        list[i] = value;
+                    }
+                    break :array list;
+                },
                 .@"struct" => |struct_info| strct: {
                     _ = struct_info;
                     if (T == String) {
                         break :strct .{ .inner = token orelse iter.next() orelse return error.MissingArgument };
                     }
                 },
-                // comptime_float: void,
-                // comptime_int: void,
-                // undefined: void,
-                // null: void,
-
                 .optional => |op| op: {
                     const ret: T = try self.readType(op.child, token, iter);
                     break :op ret;
                 },
-
-                // error_union: ErrorUnion,
-                // error_set: ErrorSet,
+                // enum_literal: void,
                 .@"enum" => meta.stringToEnum(T, token orelse iter.next() orelse "")
                     orelse return error.InvalidEnum,
                 // @"union": Union,
+
+                // comptime_float: void,
+                // comptime_int: void,
+                // undefined: void,
+                // null: void,
+                // error_union: ErrorUnion,
+                // error_set: ErrorSet,
                 // @"fn": Fn,
                 // @"opaque": Opaque,
                 // frame: Frame,
                 // @"anyframe": AnyFrame,
                 // vector: Vector,
-                // enum_literal: void,
-                else => |t| {
-                    std.debug.print("Invalued argument: {s} is type {s}\n", .{self.token, @typeName(t)});
-                    return error.InvalidArgument;
-                }
+                else => @compileError("Invalued argument: type " ++ @typeName(T) ++ " is unsupported"),
             };
         }
 
@@ -238,7 +246,8 @@ test Args {
         flag: Arg(bool) = .{ .description = "A flag" },
         value: Arg(String) = .{ .description = "a string file" },
         num: Arg(?u32) = .{ .description = "a number" },
-        variant: Arg(TestEnum) = .{
+        float: Arg(?f16) = .{ .description = "a float" },
+        variant: Arg(?TestEnum) = .{
             .short = "-o",
             .description = "A enum"
         },
@@ -250,51 +259,63 @@ test Args {
             .long = "--entries",
             .description = "Multiple strings",
         },
+        sized_array: Arg([3]u8) = .{
+            .long = "--sized",
+            .description = "A sized array of u8",
+        },
     };
 
     const tests = [_]struct {
         args: []const u8,
-        expected: struct { ?bool, ?u32, ?[]const u8, ?TestEnum, ?[]const u8, ?[]const String},
+        expected: struct { ?bool, ?[]const u8, ?u32, ?f16, ?TestEnum, ?[]const u8, ?[]const String, ?[3]u8 },
     }{
         .{
             .args = "-v config.zig",
-            .expected = .{ false, null, "config.zig", null, null, null },
+            .expected = .{ false, "config.zig", null, null, null, null, null, null },
         },
         .{
             .args = "-v config.zig --flag",
-            .expected = .{ true, null, "config.zig", null, null, null },
+            .expected = .{ true, "config.zig", null, null, null, null, null, null },
         },
         .{
             .args = "--num 2147483648",
-            .expected = .{ false, 2147483648, null, null, null, null },
+            .expected = .{ false, null, 2147483648, null, null, null, null, null },
         },
         .{
             .args = "-o less",
-            .expected = .{ false, null, null, .less, null, null },
+            .expected = .{ false, null, null, null, .less, null, null, null },
         },
         .{
             .args = "-o more",
-            .expected = .{ false, null, null, .more, null, null },
+            .expected = .{ false, null, null, null, .more, null, null, null },
         },
         .{
             .args = "--nums 1 2 3 --flag",
-            .expected = .{ true, null, null, null, &[_]u8{1, 2, 3}, null },
+            .expected = .{ true, null, null, null, null, &[_]u8{1, 2, 3}, null, null },
         },
         .{
             .args = "-v config.zig --nums 1 2 3 --flag",
-            .expected = .{ true, null, "config.zig", null, &[_]u8{1, 2, 3}, null },
+            .expected = .{ true, "config.zig", null, null, null, &[_]u8{1, 2, 3}, null, null },
         },
         .{
             .args = "--entries one two three",
-            .expected = .{ false, null, null, null, null, &[_]String{
-                .{ .inner = "one" }, .{ .inner = "two" }, .{ .inner = "three" }
-            }},
+            .expected = .{
+                false, null, null, null, null, null,
+                &[_]String{.{ .inner = "one" }, .{ .inner = "two" }, .{ .inner = "three" }},
+                null
+            },
         },
         .{
-            .args = "--flag -v config.zig -n 1 -o eq --nums 4 3 2 1 --entries one two three",
-            .expected = .{ true, 1, "config.zig", .eq, &[_]u8{4, 3, 2, 1}, &[_]String{
-                .{ .inner = "one" }, .{ .inner = "two" }, .{ .inner = "three" }
-            }},
+            .args = "--sized 255 255 255",
+            .expected = .{ false, null, null, null, null, null, null, [_]u8{ 255, 255, 255 } },
+        },
+        .{
+            .args = "--flag -v config.zig -n 1 --float 1.2 -o eq --nums 4 3 2 1 --entries one two three --sized 1 2 3",
+            .expected = .{
+                true, "config.zig", 1, 1.2, .eq, &[_]u8{4, 3, 2, 1},
+                &[_]String{.{ .inner = "one" }, .{ .inner = "two" }, .{ .inner = "three" }},
+                [3]u8{1, 2, 3}
+            },
         },
     };
 
@@ -310,17 +331,26 @@ test Args {
         const flag = t.expected.@"0";
         try std.testing.expectEqual(flag, args.flag);
 
-        const num = t.expected.@"1";
-        try std.testing.expectEqual(num, args.num);
-
-        const value = t.expected.@"2" orelse "";
+        const value = t.expected.@"1" orelse "";
         try std.testing.expectEqualStrings(value, args.value.inner);
 
-        const multivalue = t.expected.@"4" orelse &[_]u8{};
+        const num = t.expected.@"2";
+        try std.testing.expectEqual(num, args.num);
+
+        const float = t.expected.@"3";
+        try std.testing.expectEqual(float, args.float);
+
+        const variant = t.expected.@"4";
+        try std.testing.expectEqual(variant, args.variant);
+
+        const multivalue = t.expected.@"5" orelse &[_]u8{};
         try std.testing.expectEqualSlices(u8, multivalue, args.multivalue);
 
-        const multistring = t.expected.@"5" orelse &[_]String{};
+        const multistring = t.expected.@"6" orelse &[_]String{};
         try std.testing.expectEqualDeep(multistring, args.multistring);
+
+        const sized_array = t.expected.@"7" orelse [3]u8{0, 0, 0};
+        try std.testing.expectEqualDeep(sized_array, args.sized_array);
     }
 }
 
