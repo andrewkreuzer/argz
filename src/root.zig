@@ -42,6 +42,10 @@ pub fn Args(A: anytype) type {
             };
         }
 
+        pub fn deinit(self: *Self) void {
+            self.arena.deinit();
+        }
+
         const ArgStruct = ret: {
             const struct_info = @typeInfo(A);
             const in_fields = struct_info.@"struct".fields;
@@ -75,8 +79,26 @@ pub fn Args(A: anytype) type {
         }
 
         pub fn parseWithIterator(self: *Self, iter: anytype) !ArgStruct {
-            if (!@hasDecl(@TypeOf(iter.*), "next"))
-                @compileError("Iterator must implement next");
+            comptime {
+                if (!@hasDecl(@TypeOf(iter.*), "next"))
+                    @compileError("Iterator must implement next");
+
+                const fields = @typeInfo(A).@"struct".fields;
+                var shorts: [fields.len][]const u8 = [_][]const u8{""} ** fields.len;
+                var longs: [fields.len][]const u8 = [_][]const u8{""} ** fields.len;
+                for (fields, 0..) |f, i| {
+                    const arg_info = f.defaultValue().?;
+                    const short = arg_info.short orelse "-" ++ f.name[0..1];
+                    const long = arg_info.long orelse "--" ++ f.name;
+                    if (in(short, &shorts))
+                        @compileError("short flag " ++ short ++ " is being used. please provide a different .short option for " ++ f.name);
+                    if (in(long, &longs))
+                        @compileError("long flag " ++ long ++ " is being used. please provide a different .long option for " ++ f.name);
+
+                    shorts[i] = short;
+                    longs[i] = long;
+                }
+            }
 
             var args: ArgStruct = .{};
             const fields = @typeInfo(A).@"struct".fields;
@@ -97,6 +119,11 @@ pub fn Args(A: anytype) type {
                 }
             }
             return args;
+        }
+
+        fn in(comptime name: []const u8, list: [][]const u8) bool {
+            for (list) |l| if (mem.eql(u8, l, name)) return true;
+            return false;
         }
 
         fn readType(self: *Self, comptime T: anytype, token: ?[]const u8, iter: anytype) !T {
@@ -223,10 +250,6 @@ pub fn Args(A: anytype) type {
             \\{s}
             , .{self.header, options_text});
         }
-
-        pub fn deinit(self: *Self) void {
-            self.arena.deinit();
-        }
     };
 }
 
@@ -243,7 +266,7 @@ test Args {
     };
 
     const TestArgs = struct {
-        flag: Arg(bool) = .{ .description = "A flag" },
+        flag: Arg(bool) = .{ .short = "-b", .description = "A flag" },
         value: Arg(String) = .{ .description = "a string file" },
         num: Arg(?u32) = .{ .description = "a number" },
         float: Arg(?f16) = .{ .description = "a float" },
@@ -252,10 +275,12 @@ test Args {
             .description = "A enum"
         },
         multivalue: Arg([]u8) = .{
+            .short = "-m",
             .long = "--nums",
             .description = "Multiple values",
         },
         multistring: Arg([]String) = .{
+            .short = "-e",
             .long = "--entries",
             .description = "Multiple strings",
         },
