@@ -23,10 +23,17 @@ pub fn Arg(comptime T: anytype) type {
     };
 }
 
-const ArgError = error{
-    InvalidArgument,
-    FailedSettingValue,
-};
+pub fn Command(comptime T: anytype) type {
+    return struct {
+        type: type = T,
+        description: ?[]const u8 = null,
+        subcommand: bool = true,
+
+        pub fn eql(_: Command(T), comptime name: []const u8, arg: []const u8) bool {
+            return mem.eql(u8, arg, name);
+        }
+    };
+}
 
 pub fn Args(A: anytype) type {
     return struct {
@@ -46,39 +53,14 @@ pub fn Args(A: anytype) type {
             self.arena.deinit();
         }
 
-        const ArgStruct = ret: {
-            const struct_info = @typeInfo(A);
-            const in_fields = struct_info.@"struct".fields;
-            var fields: [in_fields.len]StructField = undefined;
-            for (in_fields, 0..) |f, i| {
-                const arg_info = f.defaultValue().?;
-                const default: arg_info.type = undefined;
-                fields[i] = StructField{
-                    .name = f.name,
-                    .type = arg_info.type,
-                    .default_value_ptr = @ptrCast(&default),
-                    .is_comptime = false,
-                    .alignment = @alignOf(arg_info.type),
-                };
-            }
-            break :ret @Type(.{
-                .@"struct" = .{
-                    .layout = .auto,
-                    .fields = &fields,
-                    .decls = &.{},
-                    .is_tuple = false,
-                }
-            });
-        };
-
-        pub fn parse(self: *Self) !ArgStruct {
+        pub fn parse(self: *Self) !ArgStruct(A) {
             var iter = try ArgIterator.initWithAllocator(self.arena.allocator());
             defer iter.deinit();
             _ = iter.skip(); // skip the program name
             return try self.parseWithIterator(&iter);
         }
 
-        pub fn parseWithIterator(self: *Self, iter: anytype) !ArgStruct {
+        pub fn parseWithIterator(self: *Self, iter: anytype) !ArgStruct(A) {
             comptime {
                 if (!@hasDecl(@TypeOf(iter.*), "next"))
                     @compileError("Iterator must implement next");
@@ -88,10 +70,18 @@ pub fn Args(A: anytype) type {
                 var longs: [fields.len][]const u8 = [_][]const u8{""} ** fields.len;
                 for (fields, 0..) |f, i| {
                     const arg_info = f.defaultValue().?;
+                    const type_info = @typeInfo(arg_info.type);
+                    if (type_info == .@"struct" and arg_info.type != String) {
+                        shorts[i] = "";
+                        longs[i] = f.name;
+                        continue;
+                    }
+
                     const short = arg_info.short orelse "-" ++ f.name[0..1];
-                    const long = arg_info.long orelse "--" ++ f.name;
                     if (in(short, &shorts))
                         @compileError("short flag " ++ short ++ " is being used. please provide a different .short option for " ++ f.name);
+
+                    const long = arg_info.long orelse "--" ++ f.name;
                     if (in(long, &longs))
                         @compileError("long flag " ++ long ++ " is being used. please provide a different .long option for " ++ f.name);
 
@@ -100,7 +90,7 @@ pub fn Args(A: anytype) type {
                 }
             }
 
-            var args: ArgStruct = .{};
+            var args: ArgStruct(A) = .{};
             const fields = @typeInfo(A).@"struct".fields;
             loop: while (true) {
                 const current_token = token: {
@@ -112,9 +102,13 @@ pub fn Args(A: anytype) type {
 
                 inline for (fields) |f| {
                     const arg_info = f.defaultValue().?;
-                    const InnerType: type = arg_info.type;
                     if (arg_info.eql(f.name, current_token)) {
-                        @field(args, f.name) = try self.readType(InnerType, null, iter);
+                        const is_struct = @typeInfo(arg_info.type) == .@"struct";
+                        if (is_struct and arg_info.type != String) {
+                            @field(args, f.name) = try self.readSubcommand(arg_info.type, iter);
+                        } else {
+                            @field(args, f.name) = try self.readType(arg_info.type, null, iter);
+                        }
                     }
                 }
             }
@@ -126,12 +120,34 @@ pub fn Args(A: anytype) type {
             return false;
         }
 
+        fn readSubcommand(self: *Self, comptime T: anytype, iter: anytype) !ArgStruct(T) {
+            if (@typeInfo(T) != .@"struct") @compileError("subcommand must be a struct type");
+            var sub_args: ArgStruct(T) = .{};
+            const fields = @typeInfo(T).@"struct".fields;
+            loop: while (true) {
+                const current_token = token: {
+                    if (self.token) |t| {
+                        self.token = null;
+                        break :token t;
+                    } else if (iter.next()) |t| break :token t else break :loop;
+                };
+                inline for (fields) |f| {
+                    const arg_info = f.defaultValue().?;
+                    if (arg_info.eql(f.name, current_token)) {
+                        const is_struct = @typeInfo(arg_info.type) == .@"struct";
+                        if (is_struct and arg_info.type != String) {
+                            @field(sub_args, f.name) = try self.readSubcommand(arg_info.type, iter);
+                        } else {
+                            @field(sub_args, f.name) = try self.readType(arg_info.type, null, iter);
+                        }
+                    }
+                }
+            }
+            return sub_args;
+        }
+
         fn readType(self: *Self, comptime T: anytype, token: ?[]const u8, iter: anytype) !T {
             return switch (@typeInfo(T)) {
-                .type,
-                .void,
-                .noreturn
-                    => @compileError("argument of type: " ++ @typeName(T) ++ " not supported"),
                 .@"bool" => true,
                 .int => std.fmt.parseInt(T, token orelse iter.next() orelse return error.InvalidArgument, 0),
                 .float => std.fmt.parseFloat(T, token orelse iter.next() orelse return error.InvalidArgument),
@@ -156,22 +172,16 @@ pub fn Args(A: anytype) type {
                 .array => |array_info| array: {
                     const CT = array_info.child;
                     var list: T = undefined;
-                    var i: usize = 0;
-                    while (iter.next()) |t| : (i += 1) {
-                        if (t[0] == '-') {
-                            self.token = t;
-                            break;
-                        }
-                        const value = try self.readType(CT, t, iter);
-                        list[i] = value;
+                    for (0..array_info.len) |i| {
+                        if (iter.next()) |t| {
+                            list[i] = try self.readType(CT, t, iter);
+                        } else return error.MissingArgument;
                     }
                     break :array list;
                 },
-                .@"struct" => |struct_info| strct: {
-                    _ = struct_info;
-                    if (T == String) {
-                        break :strct .{ .inner = token orelse iter.next() orelse return error.MissingArgument };
-                    }
+                .@"struct" => switch (T) {
+                    String => .{ .inner = token orelse iter.next() orelse return error.MissingArgument },
+                    else => @compileError("struct argument " ++ @typeName(T) ++ " is not supported"),
                 },
                 .optional => |op| op: {
                     const ret: T = try self.readType(op.child, token, iter);
@@ -182,6 +192,9 @@ pub fn Args(A: anytype) type {
                     orelse return error.InvalidEnum,
                 // @"union": Union,
 
+                // .type: void,
+                // .void: void,
+                // .noretur: voidn
                 // comptime_float: void,
                 // comptime_int: void,
                 // undefined: void,
@@ -193,7 +206,7 @@ pub fn Args(A: anytype) type {
                 // frame: Frame,
                 // @"anyframe": AnyFrame,
                 // vector: Vector,
-                else => @compileError("Invalued argument: type " ++ @typeName(T) ++ " is unsupported"),
+                else => @compileError("argument of type: " ++ @typeName(T) ++ " not supported"),
             };
         }
 
@@ -253,8 +266,49 @@ pub fn Args(A: anytype) type {
     };
 }
 
+fn ArgStruct(comptime T: anytype) type {
+    const info = @typeInfo(T);
+    if (info != .@"struct") @compileError(@typeName(T) ++ " is not a struct, args must be a struct type");
+    const in_fields = info.@"struct".fields;
+    var fields: [in_fields.len]StructField = undefined;
+    for (in_fields, 0..) |f, i| {
+        const arg_info = f.defaultValue().?;
+        comptime var t: type = arg_info.type;
+        const has_subcommand = @hasField(@TypeOf(arg_info), "subcommand");
+        if (has_subcommand and arg_info.subcommand) {
+            if (f.type != String) {
+                t = ArgStruct(t);
+            }
+        }
+
+        const default: t = undefined;
+        fields[i] = StructField{
+            .name = f.name,
+            .type = t,
+            .default_value_ptr = @ptrCast(&default),
+            .is_comptime = false,
+            .alignment = @alignOf(arg_info.type),
+        };
+    }
+    return @Type(.{
+        .@"struct" = .{
+            .layout = .auto,
+            .fields = &fields,
+            .decls = &.{},
+            .is_tuple = false,
+        }
+    });
+}
+
+
 pub const String = struct {
     inner: []const u8,
+};
+
+const ArgError = error{
+    InvalidArgument,
+    InvalidEnum,
+    MissingArgument,
 };
 
 test Args {
@@ -265,7 +319,12 @@ test Args {
         eq,
     };
 
+    const SubCmd = struct {
+        init: Arg(bool) = .{ .short = "-i", .description = "Initialize something" },
+    };
+
     const TestArgs = struct {
+        sub: Command(SubCmd) = .{ .description = "A subcommand" },
         flag: Arg(bool) = .{ .short = "-b", .description = "A flag" },
         value: Arg(String) = .{ .description = "a string file" },
         num: Arg(?u32) = .{ .description = "a number" },
@@ -376,6 +435,8 @@ test Args {
 
         const sized_array = t.expected.@"7" orelse [3]u8{0, 0, 0};
         try std.testing.expectEqualDeep(sized_array, args.sized_array);
+
+        try std.testing.expect(!args.sub.init);
     }
 }
 
