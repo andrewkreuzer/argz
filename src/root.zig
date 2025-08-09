@@ -4,7 +4,7 @@ const meta = std.meta;
 const process = std.process;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
-const ArgIterator = process.ArgIterator;
+const ArgIterator = @import("ArgIterator.zig");
 const Allocator = mem.Allocator;
 const StructField = std.builtin.Type.StructField;
 
@@ -35,6 +35,69 @@ pub fn Command(comptime T: anytype) type {
     };
 }
 
+const FlagInfo = struct {
+    short: ?[]const u8,
+    long: ?[]const u8,
+    context: []const u8,
+    field_name: []const u8,
+};
+
+fn validateFlags(comptime T: type, comptime context: []const u8) []const FlagInfo {
+    comptime var flags: []const FlagInfo = &[_]FlagInfo{};
+
+    const fields = @typeInfo(T).@"struct".fields;
+    inline for (fields) |field| {
+        const arg_info = field.defaultValue().?;
+
+        for (flags) |flag2| {
+            if (arg_info.short != null and flag2.short != null and
+                mem.eql(u8, arg_info.short.?, flag2.short.?)) {
+                const context1 = if (context.len == 0) "root" else context;
+                const context2 = if (flag2.context.len == 0) "root" else flag2.context;
+                @compileError(std.fmt.comptimePrint(
+                        "Short flag conflict: '{s}' is used by both '{s}.{s}' and '{s}.{s}'",
+                        .{ arg_info.short.?, context1, field.name, context2, flag2.field_name }
+                ));
+            }
+
+            if (arg_info.long != null and flag2.long != null and
+                mem.eql(u8, arg_info.long.?, flag2.long.?)) {
+                const context1 = if (context.len == 0) "root" else context;
+                const context2 = if (flag2.context.len == 0) "root" else flag2.context;
+                @compileError(std.fmt.comptimePrint(
+                        "Long flag conflict: '{s}' is used by both '{s}.{s}' and '{s}.{s}'",
+                        .{ arg_info.long.?, context1, field.name, context2, flag2.field_name }
+                ));
+            }
+        }
+
+        const has_subcommand = @hasField(@TypeOf(arg_info), "subcommand");
+        if (has_subcommand and arg_info.subcommand) {
+            const subcommand_context = if (context.len == 0) field.name else context ++ "." ++ field.name;
+            const subcommand_flags = validateFlags(arg_info.type, subcommand_context);
+            const subcommand_flag = [_]FlagInfo{.{
+                .short = null,
+                .long = field.name,
+                .context = context,
+                .field_name = field.name,
+            }};
+            flags = flags ++ &subcommand_flag ++ subcommand_flags;
+        } else {
+            const short = arg_info.short orelse "-" ++ field.name[0..1];
+            const long = arg_info.long orelse "--" ++ field.name;
+            const flag_info = [_]FlagInfo{.{
+                .short = short,
+                .long = long,
+                .context = context,
+                .field_name = field.name,
+            }};
+            flags = flags ++ &flag_info;
+        }
+    }
+
+    return flags;
+}
+
 pub fn Args(A: anytype) type {
     return struct {
         const Self = @This();
@@ -54,41 +117,16 @@ pub fn Args(A: anytype) type {
         }
 
         pub fn parse(self: *Self) !ArgStruct(A) {
-            var iter = try ArgIterator.initWithAllocator(self.arena.allocator());
-            defer iter.deinit();
+            var iter = ArgIterator.init();
             _ = iter.skip(); // skip the program name
             return try self.parseWithIterator(&iter);
         }
 
         pub fn parseWithIterator(self: *Self, iter: anytype) !ArgStruct(A) {
-            comptime {
-                if (!@hasDecl(@TypeOf(iter.*), "next"))
-                    @compileError("Iterator must implement next");
+            _ = comptime validateFlags(A, "");
+            if (!@hasDecl(@TypeOf(iter.*), "next"))
+                @compileError("Iterator must implement next");
 
-                const fields = @typeInfo(A).@"struct".fields;
-                var shorts: [fields.len][]const u8 = [_][]const u8{""} ** fields.len;
-                var longs: [fields.len][]const u8 = [_][]const u8{""} ** fields.len;
-                for (fields, 0..) |f, i| {
-                    const arg_info = f.defaultValue().?;
-                    const type_info = @typeInfo(arg_info.type);
-                    if (type_info == .@"struct" and arg_info.type != String) {
-                        shorts[i] = "";
-                        longs[i] = f.name;
-                        continue;
-                    }
-
-                    const short = arg_info.short orelse "-" ++ f.name[0..1];
-                    if (in(short, &shorts))
-                        @compileError("short flag " ++ short ++ " is being used. please provide a different .short option for " ++ f.name);
-
-                    const long = arg_info.long orelse "--" ++ f.name;
-                    if (in(long, &longs))
-                        @compileError("long flag " ++ long ++ " is being used. please provide a different .long option for " ++ f.name);
-
-                    shorts[i] = short;
-                    longs[i] = long;
-                }
-            }
 
             var args: ArgStruct(A) = .{};
             const fields = @typeInfo(A).@"struct".fields;
@@ -102,9 +140,9 @@ pub fn Args(A: anytype) type {
 
                 inline for (fields) |f| {
                     const arg_info = f.defaultValue().?;
+                    const arg_type = @TypeOf(arg_info);
                     if (arg_info.eql(f.name, current_token)) {
-                        const is_struct = @typeInfo(arg_info.type) == .@"struct";
-                        if (is_struct and arg_info.type != String) {
+                        if (@hasField(arg_type, "subcommand") and arg_info.subcommand) {
                             @field(args, f.name) = try self.readSubcommand(arg_info.type, iter);
                         } else {
                             @field(args, f.name) = try self.readType(arg_info.type, null, iter);
@@ -113,11 +151,6 @@ pub fn Args(A: anytype) type {
                 }
             }
             return args;
-        }
-
-        fn in(comptime name: []const u8, list: [][]const u8) bool {
-            for (list) |l| if (mem.eql(u8, l, name)) return true;
-            return false;
         }
 
         fn readSubcommand(self: *Self, comptime T: anytype, iter: anytype) !ArgStruct(T) {
@@ -213,55 +246,86 @@ pub fn Args(A: anytype) type {
         pub fn printHelp(self: *Self) !void {
             const stdout = self.writer orelse std.io.getStdOut().writer().any();
 
-            const arg_space, const type_space = comptime blk: {
+            const arg_space, const type_space, const has_subcommands = comptime blk: {
                 var max_arg: usize = 0;
                 var max_type: usize = 0;
+                var has_subs = false;
+
                 for (@typeInfo(A).@"struct".fields) |field| {
                     if (field.defaultValue()) |arg| {
-                        const long = arg.long orelse "--" ++ field.name;
-                        const type_name = @typeName(arg.type);
-                        if (long.len > max_arg) max_arg = long.len;
-                        if (type_name.len > max_arg) max_type = type_name.len;
+                        const has_subcommand = @hasField(@TypeOf(arg), "subcommand");
+                        if (has_subcommand and arg.subcommand) {
+                            has_subs = true;
+                        } else {
+                            const long = arg.long orelse "--" ++ field.name;
+                            const type_name = @typeName(arg.type);
+                            if (long.len > max_arg) max_arg = long.len;
+                            if (type_name.len > max_type) max_type = type_name.len;
+                        }
                     }
                 }
-                break :blk .{ max_arg, max_type };
+                break :blk .{ max_arg, max_type, has_subs };
             };
 
             const fields = @typeInfo(A).@"struct".fields;
-            var options = try std.ArrayList(u8).initCapacity(self.arena.allocator(), fields.len);
-            const writer = options.writer();
-            const seperation_spacing = 2;
+            var options = std.ArrayList(u8).init(self.arena.allocator());
+            const options_writer = options.writer();
+            var subcommands = std.ArrayList(u8).init(self.arena.allocator());
+            const subcommands_writer = subcommands.writer();
+
+            const separation_spacing = 2;
+
             inline for (fields) |field| {
                 if (field.defaultValue()) |arg| {
-                    const short = arg.short orelse "-" ++ field.name[0..1];
-                    const long = arg.long orelse "--" ++ field.name;
-                    const type_name = @typeName(arg.type);
-                    //TODO: it'd be cooler to center this value
-                    const type_spacing = arg_space - long.len + seperation_spacing;
-                    const description_spacing = type_space - type_name.len + seperation_spacing;
-                    try std.fmt.format(writer, "    {s}, {s}{s}<{s}>{s}{s}\n",
-                        .{
-                            short,
-                            long,
-                            " " ** type_spacing,
-                            type_name,
-                            " " ** description_spacing,
-                            arg.description.?
-                        }
-                    );
+                    const has_subcommand = @hasField(@TypeOf(arg), "subcommand");
+                    if (has_subcommand and arg.subcommand) {
+                        try std.fmt.format(subcommands_writer, "    {s}    {s}\n",
+                            .{ field.name, arg.description.? }
+                        );
+                    } else {
+                        const short = arg.short orelse "-" ++ field.name[0..1];
+                        const long = arg.long orelse "--" ++ field.name;
+                        const type_name = @typeName(arg.type);
+                        const type_spacing = arg_space - long.len + separation_spacing;
+                        const description_spacing = type_space - type_name.len + separation_spacing;
+
+                        try std.fmt.format(options_writer, "    {s}, {s}{s}<{s}>{s}{s}\n",
+                            .{
+                                short,
+                                long,
+                                " " ** type_spacing,
+                                type_name,
+                                " " ** description_spacing,
+                                arg.description.?
+                            }
+                        );
+                    }
                 }
             }
 
             const options_text = try options.toOwnedSlice();
             defer self.arena.allocator().free(options_text);
 
-            // TOOD: footer
-            try std.fmt.format(stdout,
-            \\{s}
-            \\
-            \\Options:
-            \\{s}
-            , .{self.header, options_text});
+            const subcommands_text = try subcommands.toOwnedSlice();
+            defer self.arena.allocator().free(subcommands_text);
+
+            if (has_subcommands) {
+                try std.fmt.format(stdout,
+                \\{s}
+                \\
+                \\Options:
+                \\{s}
+                \\Subcommands:
+                \\{s}
+                , .{self.header, options_text, subcommands_text});
+            } else {
+                try std.fmt.format(stdout,
+                \\{s}
+                \\
+                \\Options:
+                \\{s}
+                , .{self.header, options_text});
+            }
         }
     };
 }
@@ -276,9 +340,7 @@ fn ArgStruct(comptime T: anytype) type {
         comptime var t: type = arg_info.type;
         const has_subcommand = @hasField(@TypeOf(arg_info), "subcommand");
         if (has_subcommand and arg_info.subcommand) {
-            if (f.type != String) {
-                t = ArgStruct(t);
-            }
+            t = ArgStruct(t);
         }
 
         const default: t = undefined;
@@ -438,6 +500,93 @@ test Args {
 
         try std.testing.expect(!args.sub.init);
     }
+}
+
+test "subcommand" {
+    const allocator = std.testing.allocator;
+    const SubCmd = struct {
+        init: Arg(bool) = .{ .short = "-i", .description = "Initialize something" },
+    };
+
+    const TestArgs = struct {
+        sub: Command(SubCmd) = .{ .description = "A subcommand" },
+        flag: Arg(bool) = .{ .short = "-b", .description = "A flag" },
+    };
+
+    const tests = [_]struct {
+        args: []const u8,
+        expected: struct { bool, bool },
+    }{
+        .{
+            .args = "sub -i",
+            .expected = .{ true, false },
+        },
+        // .{
+        //     .args = "-f",
+        //     .expected = .{ false, true },
+        // },
+    };
+
+
+    for (tests) |t| {
+        var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
+        defer iter.deinit();
+
+        var argz = Args(TestArgs).init(allocator);
+        defer argz.deinit();
+        const args = try argz.parseWithIterator(&iter);
+
+        const sub_init = t.expected.@"0";
+        try std.testing.expectEqual(sub_init, args.sub.init);
+
+        const flag = t.expected.@"1";
+        try std.testing.expectEqual(flag, args.flag);
+    }
+}
+
+test "flag conflict detection" {
+    const ValidArgs = struct {
+        flag1: Arg(bool) = .{ .short = "-f", .description = "First flag" },
+        flag2: Arg(bool) = .{ .short = "-g", .description = "Second flag" },
+    };
+    _ = comptime validateFlags(ValidArgs, "");
+}
+
+test "help text with subcommands" {
+    const allocator = std.testing.allocator;
+
+    const SubCmd = struct {
+        init: Arg(bool) = .{ .short = "-i", .description = "Initialize something" },
+    };
+
+    const TestArgs = struct {
+        sub: Command(SubCmd) = .{ .description = "A subcommand" },
+        flag: Arg(bool) = .{ .short = "-f", .description = "A flag" },
+        value: Arg(String) = .{ .description = "Configuration file" },
+    };
+
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(buf[0..]);
+    const writer = fbs.writer();
+
+    var argz = Args(TestArgs).init(allocator);
+    defer argz.deinit();
+
+    argz.writer = writer.any();
+    try argz.printHelp();
+
+    const expected =
+        \\Usage: root.test.help text with subcommands.TestArgs [options]
+        \\
+        \\Options:
+        \\    -f, --flag   <bool>         A flag
+        \\    -v, --value  <root.String>  Configuration file
+        \\
+        \\Subcommands:
+        \\    sub    A subcommand
+        \\
+        ;
+    try std.testing.expectEqualStrings(expected, fbs.getWritten());
 }
 
 test "help text" {

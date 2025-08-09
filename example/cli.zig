@@ -16,7 +16,7 @@ pub fn main() !void {
     const Args = struct {
         one: argz.Arg(bool) = .{ .description = "A simple flag" },
         two: argz.Arg([]u8) = .{ .description = "a u8 list" },
-        three: argz.Arg(String) = .{ .description = "a string type" },
+        three: argz.Arg(String) = .{ .short = "-s", .description = "a string type" },
         four: argz.Arg(Switch) = .{ .description = "an enum type" },
     };
 

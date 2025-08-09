@@ -21,6 +21,20 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&example_cmd.step);
     if (b.args) |args| example_cmd.addArgs(args);
 
+    const help_demo = b.addExecutable(.{
+        .name = "help-demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("example/help_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    help_demo.root_module.addImport("argz", lib_mod);
+    const help_demo_cmd = b.addRunArtifact(help_demo);
+    help_demo_cmd.step.dependOn(b.getInstallStep());
+    const help_step = b.step("help-demo", "Show help text demo with subcommands");
+    help_step.dependOn(&help_demo_cmd.step);
+
     const lib_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
