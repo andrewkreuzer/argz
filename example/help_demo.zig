@@ -14,8 +14,9 @@ pub fn main() !void {
 
     const Args = struct {
         help: argz.Arg(bool) = .{ .short = "-h", .long = "--help", .description = "Show help" },
+        pos: argz.Positional(String) = .{ .description = "Position argument" },
         config: argz.Arg(String) = .{ .short = "-c", .description = "Configuration file" },
-        sub: argz.Command(SubCmd) = .{ .description = "Initialize subcommand" },
+        sub: argz.SubCommand(SubCmd) = .{ .description = "Initialize subcommand" },
     };
 
     var cli = argz.Args(Args).init(allocator);
