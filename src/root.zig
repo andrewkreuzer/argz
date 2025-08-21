@@ -485,6 +485,10 @@ fn ArgStruct(comptime T: anytype) type {
             else => {}
         }
 
+        // TODO: I'm relying on undefined to avoid using null
+        // and having to do extra checks everywhere, but...
+        // 0.15.1 handles undefined differently and we can
+        // no longer use this aweful trick
         const default: t = undefined;
         fields[i] = StructField{
             .name = f.name,
