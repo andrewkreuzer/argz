@@ -4,11 +4,10 @@ const meta = std.meta;
 const process = std.process;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
+const ArgIterator = std.process.ArgIterator;
 const ArrayList = std.ArrayList;
 const StructField = std.builtin.Type.StructField;
 
-
-const ArgIterator = @import("ArgIterator.zig");
 
 pub const ArgType = enum {
     arg,
@@ -84,20 +83,30 @@ pub fn Args(A: anytype) type {
             if (!@hasDecl(@TypeOf(iter.*), "next"))
                 @compileError("Iterator must implement next");
 
-            _ = comptime validateFlags(A, "");
-            return self.readCommand(A, iter);
+            const flags = comptime validateFlags(A, "");
+            return self.readCommandWithContext(A, flags, "", iter);
         }
 
-        fn readCommand(self: *Self, comptime T: anytype, iter: anytype) !ArgStruct(T) {
+        fn readCommandWithContext(
+            self: *Self,
+            comptime T: anytype,
+            comptime flags: []const FlagInfo,
+            comptime context: []const u8,
+            iter: anytype,
+        ) !ArgStruct(T) {
             if (@typeInfo(T) != .@"struct") @compileError("commands must be a struct type");
             var args: ArgStruct(T) = .{};
             const fields = @typeInfo(T).@"struct".fields;
             var pos_index: usize = 0;
 
-            // How can we track fields which have been filled
-            // vs ones that can be set to a default? and check
-            // that all required fields are set after we're done?
+            // Track which fields have been set using field index
+            var field_set: [fields.len]bool = [_]bool{false} ** fields.len;
 
+            // we loop over the arguments instead of the fields
+            // because there's no easy way to reset the arg iterators
+            // in the standard library and we should leverage the work done
+            // there for parsing different targets. It does make determining
+            // required arguments a bit more complex though
             loop: while (true) {
                 const token = token: {
                     if (self.token) |t| {
@@ -112,11 +121,15 @@ pub fn Args(A: anytype) type {
                         switch (arg_info.arg_type) {
                             .arg => @field(args, f.name) = try self.readType(arg_info.type, null, iter),
                             .positional => unreachable,
-                            .subcommand => switch (@typeInfo(arg_info.type)) {
-                                .optional => |op| @field(args, f.name) = try self.readCommand(op.child, iter),
-                                else => @field(args, f.name) = try self.readCommand(arg_info.type, iter),
+                            .subcommand => {
+                                const sub_context = if (context.len == 0) f.name else context ++ "." ++ f.name;
+                                switch (@typeInfo(arg_info.type)) {
+                                    .optional => |op| @field(args, f.name) = try self.readCommandWithContext(op.child, flags, sub_context, iter),
+                                    else => @field(args, f.name) = try self.readCommandWithContext(arg_info.type, flags, sub_context, iter),
+                                }
                             },
                         }
+                        field_set[i] = true;
                         continue :loop;
                     }
 
@@ -128,6 +141,7 @@ pub fn Args(A: anytype) type {
                         if (i >= pos_index) {
                             @field(args, f.name) = try self.readType(arg_info.type, token, iter);
                             pos_index += 1;
+                            field_set[i] = true;
                             continue :loop;
                         }
                     }
@@ -136,8 +150,10 @@ pub fn Args(A: anytype) type {
                 // didn't match anything put it back for the parent context iterator
                 self.token = token;
                 break;
-
             }
+
+            // Validate required fields for this context
+            try self.validateRequiredFields(T, &field_set, flags, context);
             return args;
         }
 
@@ -203,6 +219,32 @@ pub fn Args(A: anytype) type {
                 // vector: Vector,
                 else => @compileError("argument of type: " ++ @typeName(T) ++ " not supported"),
             };
+        }
+
+        fn validateRequiredFields(
+            _: *Self,
+            comptime T: type,
+            field_set: []const bool,
+            comptime flags: []const FlagInfo,
+            comptime context: []const u8
+        ) !void {
+            const fields = @typeInfo(T).@"struct".fields;
+
+            inline for (fields, 0..) |field, i| {
+                const required = comptime blk: {
+                    for (flags) |flag| {
+                        if (
+                            mem.eql(u8, flag.field_name, field.name)
+                            and mem.eql(u8, flag.context, context)
+                        ) {
+                            break :blk flag.required;
+                        }
+                    }
+                };
+                if (required and !field_set[i]) {
+                    return error.MissingRequiredArgument;
+                }
+            }
         }
 
         pub fn printHelp(self: *Self) !void {
@@ -337,6 +379,7 @@ const FlagInfo = struct {
     long: ?[]const u8,
     context: []const u8,
     field_name: []const u8,
+    required: bool = false,
 };
 
 test "flag conflict detection" {
@@ -380,25 +423,25 @@ fn validateFlags(comptime T: type, comptime context: []const u8) []const FlagInf
 
         var short: ?[]const u8 = null;
         var long: ?[]const u8 = null;
+        var subcommand_flags: ?[]const FlagInfo = null;
         switch (arg_info.arg_type) {
             .arg => {
                 short = arg_info.short orelse "-" ++ field.name[0..1];
                 long = arg_info.long orelse "--" ++ field.name;
             },
-            .positional => continue,
+            .positional => {},
             .subcommand => {
                 const command_ctx = switch (context.len) {
                     0 => field.name,
                     else => context ++ "." ++ field.name,
                 };
 
-                const command_flags = switch (t_info) {
+                subcommand_flags = switch (t_info) {
                     .optional => |op| validateFlags(op.child, command_ctx),
                     else => validateFlags(t, command_ctx),
                 };
 
                 long = field.name;
-                flags = flags ++ command_flags;
             },
         }
 
@@ -421,13 +464,20 @@ fn validateFlags(comptime T: type, comptime context: []const u8) []const FlagInf
             }
         }
 
+        const required = switch (t_info) {
+            .optional, .@"bool", .pointer => false,
+            else => true,
+        };
+
         const flag_info = [_]FlagInfo{.{
             .short = short,
             .long = long,
             .context = context,
             .field_name = field.name,
+            .required = required,
         }};
         flags = flags ++ &flag_info;
+        if (subcommand_flags) |scf| flags = flags ++ scf;
 
     }
 
@@ -457,6 +507,10 @@ fn ArgStruct(comptime T: anytype) type {
         const default: t = switch (t_info) {
             .optional => null,
             .@"bool" => false,
+            .pointer => |ptr_info| switch (ptr_info.size) {
+                .slice => &.{},
+                .one, .many, .c => @compileError("only slice pointer types are supported"),
+            },
             .@"struct" => switch (t) {
                 // hmm ??
                 // ArrayList => .empty,
@@ -491,6 +545,7 @@ const ArgError = error{
     InvalidArgument,
     InvalidEnum,
     MissingArgument,
+    MissingRequiredArgument,
 };
 
 test Args {
@@ -515,12 +570,12 @@ test Args {
             .short = "-o",
             .description = "A enum"
         },
-        multivalue: Arg(?[]u8) = .{
+        multivalue: Arg([]u8) = .{
             .short = "-m",
             .long = "--nums",
             .description = "Multiple values",
         },
-        multistring: Arg(?[]String) = .{
+        multistring: Arg([]String) = .{
             .short = "-e",
             .long = "--entries",
             .description = "Multiple strings",
@@ -539,50 +594,50 @@ test Args {
             ?u32, // num
             ?f16, // float
             ?TestEnum, // variant
-            ?[]const u8, // multivalue
-            ?[]const String, // multistring
+            []const u8, // multivalue
+            []const String, // multistring
             ?[3]u8 // sized_array
         },
     }{
         .{
             .args = "-v config.zig",
-            .expected = .{ false, .{ .inner = "config.zig" }, null, null, null, null, null, null },
+            .expected = .{ false, .{ .inner = "config.zig" }, null, null, null, &.{}, &.{}, null },
         },
         .{
             .args = "-v config.zig --flag",
-            .expected = .{ true, .{ .inner = "config.zig" }, null, null, null, null, null, null },
+            .expected = .{ true, .{ .inner = "config.zig" }, null, null, null, &.{}, &.{}, null },
         },
         .{
             .args = "--num 2147483648",
-            .expected = .{ false, null, 2147483648, null, null, null, null, null },
+            .expected = .{ false, null, 2147483648, null, null, &.{}, &.{}, null },
         },
         .{
             .args = "-o less",
-            .expected = .{ false, null, null, null, .less, null, null, null },
+            .expected = .{ false, null, null, null, .less, &.{}, &.{}, null },
         },
         .{
             .args = "-o more",
-            .expected = .{ false, null, null, null, .more, null, null, null },
+            .expected = .{ false, null, null, null, .more, &.{}, &.{}, null },
         },
         .{
             .args = "--nums 1 2 3 --flag",
-            .expected = .{ true, null, null, null, null, &[_]u8{1, 2, 3}, null, null },
+            .expected = .{ true, null, null, null, null, &[_]u8{1, 2, 3}, &.{}, null },
         },
         .{
             .args = "-v config.zig --nums 1 2 3 --flag",
-            .expected = .{ true, .{ .inner = "config.zig" }, null, null, null, &[_]u8{1, 2, 3}, null, null },
+            .expected = .{ true, .{ .inner = "config.zig" }, null, null, null, &[_]u8{1, 2, 3}, &.{}, null },
         },
         .{
             .args = "--entries one two three",
             .expected = .{
-                false, null, null, null, null, null,
+                false, null, null, null, null, &.{},
                 &[_]String{.{ .inner = "one" }, .{ .inner = "two" }, .{ .inner = "three" }},
                 null
             },
         },
         .{
             .args = "--sized 255 255 255",
-            .expected = .{ false, null, null, null, null, null, null, [_]u8{ 255, 255, 255 } },
+            .expected = .{ false, null, null, null, null, &.{}, &.{}, [_]u8{ 255, 255, 255 } },
         },
         .{
             .args = "--flag -v config.zig -n 1 --float 1.2 -o eq --nums 4 3 2 1 --entries one two three --sized 1 2 3",
@@ -631,28 +686,77 @@ test Args {
     }
 }
 
-// test "required" {
-//     const allocator = std.testing.allocator;
-//     const TestArgs = struct {
-//         pos: Positional(String) = .{ .description = "A positional argument" },
-//     };
+test "required" {
+    const allocator = std.testing.allocator;
+    const TestArgs = struct {
+        pos: Positional(u8) = .{ .description = "A positional argument" },
+    };
 
-//     const tests = [_]struct {
-//         args: []const u8,
-//     }{
-//         .{ .args = "" },
-//     };
+    var iter = try process.ArgIteratorGeneral(.{}).init(allocator, "");
+    defer iter.deinit();
 
+    var argz = Args(TestArgs).init(allocator);
+    defer argz.deinit();
+    try std.testing.expectError(error.MissingRequiredArgument, argz.parseWithIterator(&iter));
+}
 
-//     for (tests) |t| {
-//         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
-//         defer iter.deinit();
+test "required subcommand" {
+    const allocator = std.testing.allocator;
+    const SubCmd = struct {
+        pos: Positional(u8) = .{ .description = "Required when sub is used" },
+    };
 
-//         var argz = Args(TestArgs).init(allocator);
-//         defer argz.deinit();
-//         try std.testing.expectError(error.MissingArgument, argz.parseWithIterator(&iter));
-//     }
-// }
+    const TestArgs = struct {
+        sub: SubCommand(SubCmd) = .{ .description = "required subcommand" },
+    };
+
+    var iter = try process.ArgIteratorGeneral(.{}).init(allocator, "");
+    defer iter.deinit();
+
+    var argz = Args(TestArgs).init(allocator);
+    defer argz.deinit();
+    try std.testing.expectError(error.MissingRequiredArgument, argz.parseWithIterator(&iter));
+}
+
+test "required with context" {
+    const allocator = std.testing.allocator;
+
+    const SubCmd = struct {
+        required_in_sub: Positional(u8) = .{ .description = "Required when sub is used" },
+        optional_flag: Arg(bool) = .{ .description = "Optional flag" },
+    };
+
+    const TestArgs = struct {
+        sub: SubCommand(?SubCmd) = .{ .description = "Optional subcommand" },
+        global_flag: Arg(bool) = .{ .description = "Global optional flag" },
+    };
+
+    {
+        var iter = try process.ArgIteratorGeneral(.{}).init(allocator, "");
+        defer iter.deinit();
+        var argz = Args(TestArgs).init(allocator);
+        defer argz.deinit();
+        _ = try argz.parseWithIterator(&iter);
+    }
+
+    {
+        var iter = try process.ArgIteratorGeneral(.{}).init(allocator, "sub");
+        defer iter.deinit();
+        var argz = Args(TestArgs).init(allocator);
+        defer argz.deinit();
+        try std.testing.expectError(error.MissingRequiredArgument, argz.parseWithIterator(&iter));
+    }
+
+    {
+        var iter = try process.ArgIteratorGeneral(.{}).init(allocator, "sub 42");
+        defer iter.deinit();
+        var argz = Args(TestArgs).init(allocator);
+        defer argz.deinit();
+        const args = try argz.parseWithIterator(&iter);
+        try std.testing.expect(args.sub != null);
+        try std.testing.expectEqual(@as(u8, 42), args.sub.?.required_in_sub);
+    }
+}
 
 test "positional" {
     const allocator = std.testing.allocator;
@@ -670,8 +774,6 @@ test "positional" {
         .{ .args = "one two", .expected = .{  .{ .inner = "one" }, .{ .inner = "two" }, false } },
         .{ .args = "one -f", .expected = .{ .{ .inner = "one" }, null, true } },
         .{ .args = "-f one", .expected = .{ .{ .inner = "one" }, null, true } },
-        // TODO: should throw error that required positional argument is missing
-        // .{ .args = "", .expected = .{ null, null, true } },
     };
 
 
