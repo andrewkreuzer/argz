@@ -60,7 +60,7 @@ pub fn Args(A: anytype) type {
         const Self = @This();
         header: []const u8 = std.fmt.comptimePrint("Usage: {s} [options]", .{@typeName(A)}),
         arena: ArenaAllocator,
-        writer: ?std.io.AnyWriter = null,
+        writer: ?*std.io.Writer = null,
         token: ?[]const u8 = null,
 
         pub fn init(allocator: Allocator) Self {
@@ -165,16 +165,16 @@ pub fn Args(A: anytype) type {
                 .pointer => |ptr_info| switch (ptr_info.size) {
                     .slice => slice: {
                         const CT = ptr_info.child;
-                        var list = ArrayList(CT).init(self.arena.allocator());
+                        var list: ArrayList(CT) = .empty;
                         while (iter.next()) |t| {
                             if (t[0] == '-') {
                                 self.token = t;
                                 break;
                             }
                             const value = try self.readType(CT, t, iter);
-                            try list.append(value);
+                            try list.append(self.arena.allocator(), value);
                         }
-                        break :slice try list.toOwnedSlice();
+                        break :slice try list.toOwnedSlice(self.arena.allocator());
                     },
                     .one,
                     .many,
@@ -248,7 +248,11 @@ pub fn Args(A: anytype) type {
         }
 
         pub fn printHelp(self: *Self) !void {
-            const stdout = self.writer orelse std.io.getStdOut().writer().any();
+            const stdout = self.writer orelse writer: {
+                var stdout_buffer: [4096]u8 = undefined;
+                var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+                break :writer &stdout_writer.interface;
+            };
 
             const arg_space, const type_space, const has_positional, const has_subcommands = comptime blk: {
                 var max_arg: usize = 0;
@@ -279,12 +283,12 @@ pub fn Args(A: anytype) type {
 
             const separation_spacing = 2;
             const fields = @typeInfo(A).@"struct".fields;
-            var arguments = std.ArrayList(u8).init(self.arena.allocator());
-            const arg_writer = arguments.writer();
-            var options = std.ArrayList(u8).init(self.arena.allocator());
-            const options_writer = options.writer();
-            var subcommands = std.ArrayList(u8).init(self.arena.allocator());
-            const subcommands_writer = subcommands.writer();
+            var arguments = std.io.Writer.Allocating.init(self.arena.allocator());
+            const arg_writer = &arguments.writer;
+            var options = std.io.Writer.Allocating.init(self.arena.allocator());
+            const options_writer = &options.writer;
+            var subcommands = std.io.Writer.Allocating.init(self.arena.allocator());
+            const subcommands_writer = &subcommands.writer;
 
             inline for (fields) |field| {
                 if (field.defaultValue()) |arg| {
@@ -296,7 +300,7 @@ pub fn Args(A: anytype) type {
                             const type_spacing = arg_space - long.len + separation_spacing;
                             const description_spacing = type_space - type_name.len + separation_spacing;
 
-                            try std.fmt.format(options_writer, "    {s}, {s}{s}<{s}>{s}{s}\n",
+                            try options_writer.print("    {s}, {s}{s}<{s}>{s}{s}\n",
                                 .{
                                     short,
                                     long,
@@ -312,7 +316,7 @@ pub fn Args(A: anytype) type {
                             const description_spacing = type_space - type_name.len + separation_spacing;
                             var upper_name: [field.name.len]u8 = undefined;
                             _ = std.ascii.upperString(&upper_name, field.name);
-                            try std.fmt.format(arg_writer, "    [{s}]{s}<{s}>{s}{s}\n",
+                            try arg_writer.print("    [{s}]{s}<{s}>{s}{s}\n",
                                 .{
                                     upper_name,
                                     " " ** (arg_space - field.name.len + separation_spacing),
@@ -323,7 +327,7 @@ pub fn Args(A: anytype) type {
                             );
                         },
                         .subcommand => {
-                            try std.fmt.format(subcommands_writer, "    {s}    {s}\n",
+                            try subcommands_writer.print("    {s}    {s}\n",
                                 .{ field.name, arg.description.? }
                             );
                         },
@@ -340,14 +344,14 @@ pub fn Args(A: anytype) type {
             const subcommands_text = try subcommands.toOwnedSlice();
             defer self.arena.allocator().free(subcommands_text);
 
-            try std.fmt.format(stdout,
+            try stdout.print(
                 \\{s}
                 \\
                 , .{self.header}
             );
 
             if (has_positional) {
-                try std.fmt.format(stdout,
+                try stdout.print(
                     \\
                     \\Arguments:
                     \\{s}
@@ -355,7 +359,7 @@ pub fn Args(A: anytype) type {
                 );
             }
 
-            try std.fmt.format(stdout,
+            try stdout.print(
                 \\
                 \\Options:
                 \\{s}
@@ -363,13 +367,14 @@ pub fn Args(A: anytype) type {
             );
 
             if (has_subcommands) {
-                try std.fmt.format(stdout,
+                try stdout.print(
                     \\
                     \\Subcommands:
                     \\{s}
                     , .{subcommands_text}
                 );
             }
+            try stdout.flush();
         }
     };
 }
@@ -1025,14 +1030,13 @@ test "help text" {
         },
     };
 
-    var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(buf[0..]);
-    const writer = fbs.writer();
+    var buf: [4096]u8 = undefined;
+    var writer: std.io.Writer = .fixed(&buf);
 
     var argz = Args(TestArgs).init(allocator);
     defer argz.deinit();
 
-    argz.writer = writer.any();
+    argz.writer = &writer;
     try argz.printHelp();
 
     const expected =
@@ -1048,7 +1052,7 @@ test "help text" {
         \\    -m, --entries  <[]root.String>  Multiple strings
         \\
         ;
-    try std.testing.expectEqualStrings(expected, fbs.getWritten());
+    try std.testing.expectEqualStrings(expected, writer.buffered());
 }
 
 test "help text with subcommands" {
@@ -1064,14 +1068,13 @@ test "help text with subcommands" {
         value: Arg(String) = .{ .description = "Configuration file" },
     };
 
-    var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(buf[0..]);
-    const writer = fbs.writer();
+    var buf: [4096]u8 = undefined;
+    var writer: std.io.Writer = .fixed(&buf);
 
     var argz = Args(TestArgs).init(allocator);
     defer argz.deinit();
 
-    argz.writer = writer.any();
+    argz.writer = &writer;
     try argz.printHelp();
 
     const expected =
@@ -1085,5 +1088,5 @@ test "help text with subcommands" {
         \\    sub    A subcommand
         \\
         ;
-    try std.testing.expectEqualStrings(expected, fbs.getWritten());
+    try std.testing.expectEqualStrings(expected, writer.buffered());
 }

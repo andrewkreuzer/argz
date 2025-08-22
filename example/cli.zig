@@ -27,7 +27,7 @@ pub fn main() !void {
 
     // zig build example -- --one --two 1 2 3 --three string --four two
     std.debug.print("one: value '{any}' of type {s}\n", .{args.one, @typeName(@TypeOf(args.one))});
-    std.debug.print("two: value '{d}' with length: {d} of type {s}\n", .{args.two, args.two.len, @typeName(@TypeOf(args.two))});
+    std.debug.print("two: value '{any}' with length: {d} of type {s}\n", .{args.two, args.two.len, @typeName(@TypeOf(args.two))});
 
     if (args.three) |s| {
         std.debug.print("three: value '{s}' of type {s}\n", .{s.inner, @typeName(@TypeOf(s))});
