@@ -4,9 +4,9 @@ const mem = std.mem;
 const Self = @This();
 
 index: usize,
-    count: usize,
+count: usize,
 
-    pub const InitError = error{};
+pub const InitError = error{};
 
 pub fn init() Self {
     return .{

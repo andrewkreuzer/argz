@@ -2,22 +2,24 @@ const std = @import("std");
 const mem = std.mem;
 const meta = std.meta;
 const process = std.process;
+const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
-const ArgIterator = @import("ArgIterator.zig");
-const Allocator = mem.Allocator;
 const StructField = std.builtin.Type.StructField;
 
+
+const ArgIterator = @import("ArgIterator.zig");
+
 pub const ArgType = enum {
-    Arg,
-    Positional,
-    SubCommand,
+    arg,
+    positional,
+    subcommand,
 };
 
 pub fn Arg(comptime T: anytype) type {
     return struct {
         type: type = T,
-        arg_type: ArgType = .Arg,
+        arg_type: ArgType = .arg,
         short: ?[]const u8 = null,
         long: ?[]const u8 = null,
         description: ?[]const u8 = null,
@@ -33,8 +35,9 @@ pub fn Arg(comptime T: anytype) type {
 pub fn Positional(comptime T: anytype) type {
     return struct {
         type: type = T,
-        arg_type: ArgType = .Positional,
+        arg_type: ArgType = .positional,
         description: ?[]const u8 = null,
+
         pub fn eql(_: Positional(T), comptime _: []const u8, _: []const u8) bool {
             return false;
         }
@@ -44,7 +47,7 @@ pub fn Positional(comptime T: anytype) type {
 pub fn SubCommand(comptime T: anytype) type {
     return struct {
         type: type = T,
-        arg_type: ArgType = .SubCommand,
+        arg_type: ArgType = .subcommand,
         description: ?[]const u8 = null,
 
         pub fn eql(_: SubCommand(T), comptime name: []const u8, arg: []const u8) bool {
@@ -60,7 +63,6 @@ pub fn Args(A: anytype) type {
         arena: ArenaAllocator,
         writer: ?std.io.AnyWriter = null,
         token: ?[]const u8 = null,
-        positional_index: usize = 0,
 
         pub fn init(allocator: Allocator) Self {
             return .{
@@ -79,95 +81,64 @@ pub fn Args(A: anytype) type {
         }
 
         pub fn parseWithIterator(self: *Self, iter: anytype) !ArgStruct(A) {
-            _ = comptime validateFlags(A, "");
             if (!@hasDecl(@TypeOf(iter.*), "next"))
                 @compileError("Iterator must implement next");
 
-            var args: ArgStruct(A) = .{};
-            const fields = @typeInfo(A).@"struct".fields;
-            const positional_fields = comptime getPositionalFields(A);
-
-            loop: while (true) {
-                const current_token = token: {
-                    if (self.token) |t| {
-                        self.token = null;
-                        break :token t;
-                    } else if (iter.next()) |t| break :token t else break :loop;
-                };
-
-                inline for (fields) |f| {
-                    const arg_info = f.defaultValue().?;
-                    if (arg_info.eql(f.name, current_token)) {
-                        switch (arg_info.arg_type) {
-                            .Arg => @field(args, f.name) = try self.readType(arg_info.type, null, iter),
-                            .SubCommand => @field(args, f.name) = try self.readSubcommand(arg_info.type, iter),
-                            .Positional => unreachable,
-                        }
-                        continue :loop;
-                    }
-                }
-
-                const is_flag = current_token[0] == '-';
-                if (!is_flag) {
-                    inline for (positional_fields, 0..) |field, field_index| {
-                        if (field_index == self.positional_index) {
-                            const arg_info = field.defaultValue().?;
-                            @field(args, field.name) = try self.readType(arg_info.type, current_token, iter);
-                            self.positional_index += 1;
-                            continue :loop;
-                        }
-                    }
-                }
-            }
-            return args;
+            _ = comptime validateFlags(A, "");
+            return self.readCommand(A, iter);
         }
 
-        fn readSubcommand(self: *Self, comptime T: anytype, iter: anytype) !ArgStruct(T) {
-            if (@typeInfo(T) != .@"struct") @compileError("subcommand must be a struct type");
-            var sub_args: ArgStruct(T) = .{};
+        fn readCommand(self: *Self, comptime T: anytype, iter: anytype) !ArgStruct(T) {
+            if (@typeInfo(T) != .@"struct") @compileError("commands must be a struct type");
+            var args: ArgStruct(T) = .{};
             const fields = @typeInfo(T).@"struct".fields;
-            const positional_fields = comptime getPositionalFields(T);
-            var subcommand_positional_index: usize = 0;
+            var pos_index: usize = 0;
+
+            // How can we track fields which have been filled
+            // vs ones that can be set to a default? and check
+            // that all required fields are set after we're done?
 
             loop: while (true) {
-                const current_token = token: {
+                const token = token: {
                     if (self.token) |t| {
                         self.token = null;
                         break :token t;
                     } else if (iter.next()) |t| break :token t else break :loop;
                 };
 
-                inline for (fields) |f| {
+                inline for (fields, 0..) |f, i| {
                     const arg_info = f.defaultValue().?;
-                    if (arg_info.arg_type == .Positional) continue;
-                    if (arg_info.eql(f.name, current_token)) {
+                    if (arg_info.eql(f.name, token)) {
                         switch (arg_info.arg_type) {
-                            .Arg => @field(sub_args, f.name) = try self.readType(arg_info.type, null, iter),
-                            .SubCommand => @field(sub_args, f.name) = try self.readSubcommand(arg_info.type, iter),
-                            .Positional => unreachable,
+                            .arg => @field(args, f.name) = try self.readType(arg_info.type, null, iter),
+                            .positional => unreachable,
+                            .subcommand => switch (@typeInfo(arg_info.type)) {
+                                .optional => |op| @field(args, f.name) = try self.readCommand(op.child, iter),
+                                else => @field(args, f.name) = try self.readCommand(arg_info.type, iter),
+                            },
                         }
                         continue :loop;
                     }
-                }
 
-                const is_flag = current_token[0] == '-';
-                if (!is_flag) {
-                    inline for (positional_fields, 0..) |field, field_index| {
-                        if (field_index == subcommand_positional_index) {
-                            const arg_info = field.defaultValue().?;
-                            @field(sub_args, field.name) = try self.readType(arg_info.type, current_token, iter);
-                            subcommand_positional_index += 1;
+                    const is_flag = if (token.len > 0) (token[0] == '-') else false;
+                    if (!is_flag and arg_info.arg_type == .positional) {
+                        // we keep track of positionals we've seen
+                        // as long as we're above that index we can
+                        // consume the token as the positional arg
+                        if (i >= pos_index) {
+                            @field(args, f.name) = try self.readType(arg_info.type, token, iter);
+                            pos_index += 1;
                             continue :loop;
                         }
                     }
                 }
 
                 // didn't match anything put it back for the parent context iterator
-                self.token = current_token;
+                self.token = token;
                 break;
 
             }
-            return sub_args;
+            return args;
         }
 
         fn readType(self: *Self, comptime T: anytype, token: ?[]const u8, iter: anytype) !T {
@@ -246,18 +217,18 @@ pub fn Args(A: anytype) type {
                 for (@typeInfo(A).@"struct".fields) |field| {
                     if (field.defaultValue()) |arg| {
                         switch (arg.arg_type) {
-                            .Arg => {
+                            .arg => {
                                 const long = arg.long orelse "--" ++ field.name;
                                 const type_name = @typeName(arg.type);
                                 if (long.len > max_arg) max_arg = long.len;
                                 if (type_name.len > max_type) max_type = type_name.len;
                             },
-                            .Positional => {
+                            .positional => {
                                 const type_name = @typeName(arg.type);
                                 if (type_name.len > max_type) max_type = type_name.len;
                                 has_pos = true;
                             },
-                            .SubCommand => has_subs = true,
+                            .subcommand => has_subs = true,
                         }
                     }
                 }
@@ -276,7 +247,7 @@ pub fn Args(A: anytype) type {
             inline for (fields) |field| {
                 if (field.defaultValue()) |arg| {
                     switch (arg.arg_type) {
-                        .Arg => {
+                        .arg => {
                             const short = arg.short orelse "-" ++ field.name[0..1];
                             const long = arg.long orelse "--" ++ field.name;
                             const type_name = @typeName(arg.type);
@@ -294,7 +265,7 @@ pub fn Args(A: anytype) type {
                                 }
                             );
                         },
-                        .Positional => {
+                        .positional => {
                             const type_name = @typeName(arg.type);
                             const description_spacing = type_space - type_name.len + separation_spacing;
                             var upper_name: [field.name.len]u8 = undefined;
@@ -309,7 +280,7 @@ pub fn Args(A: anytype) type {
                                 }
                             );
                         },
-                        .SubCommand => {
+                        .subcommand => {
                             try std.fmt.format(subcommands_writer, "    {s}    {s}\n",
                                 .{ field.name, arg.description.? }
                             );
@@ -361,22 +332,6 @@ pub fn Args(A: anytype) type {
     };
 }
 
-fn getPositionalFields(comptime T: type) []const StructField {
-    const info = @typeInfo(T);
-    if (info != .@"struct")
-        @compileError(@typeName(T) ++ " is not a struct, args must be a struct type");
-
-    comptime var positional_fields: []const StructField = &[_]StructField{};
-    const fields = info.@"struct".fields;
-    inline for (fields) |field| {
-        const arg_info = field.defaultValue().?;
-        if (arg_info.arg_type == .Positional) {
-            positional_fields = positional_fields ++ &[_]StructField{field};
-        }
-    }
-    return positional_fields;
-}
-
 const FlagInfo = struct {
     short: ?[]const u8,
     long: ?[]const u8,
@@ -420,39 +375,48 @@ fn validateFlags(comptime T: type, comptime context: []const u8) []const FlagInf
     const fields = info.@"struct".fields;
     inline for (fields) |field| {
         const arg_info = field.defaultValue().?;
+        const t: type = arg_info.type;
+        const t_info = @typeInfo(t);
 
         var short: ?[]const u8 = null;
         var long: ?[]const u8 = null;
         switch (arg_info.arg_type) {
-            .Arg => {
+            .arg => {
                 short = arg_info.short orelse "-" ++ field.name[0..1];
                 long = arg_info.long orelse "--" ++ field.name;
             },
-            .Positional => continue, // positional arguments do not have flags
-            .SubCommand => {
-                const subcommand_context = if (context.len == 0) field.name else context ++ "." ++ field.name;
-                const subcommand_flags = validateFlags(arg_info.type, subcommand_context);
+            .positional => continue,
+            .subcommand => {
+                const command_ctx = switch (context.len) {
+                    0 => field.name,
+                    else => context ++ "." ++ field.name,
+                };
+
+                const command_flags = switch (t_info) {
+                    .optional => |op| validateFlags(op.child, command_ctx),
+                    else => validateFlags(t, command_ctx),
+                };
+
                 long = field.name;
-                flags = flags ++ subcommand_flags;
+                flags = flags ++ command_flags;
             },
         }
 
-        for (flags) |flag2| {
-            if (short != null and flag2.short != null and mem.eql(u8, short.?, flag2.short.?)) {
-                const context1 = if (context.len == 0) "root" else context;
-                const context2 = if (flag2.context.len == 0) "root" else flag2.context;
+        for (flags) |flag| {
+            const ctx1 = if (context.len == 0) "root" else context;
+            const ctx2 = if (flag.context.len == 0) "root" else flag.context;
+
+            if (short != null and flag.short != null and mem.eql(u8, short.?, flag.short.?)) {
                 @compileError(std.fmt.comptimePrint(
-                        "Short flag conflict: '{s}' is used by both '{s}.{s}' and '{s}.{s}'",
-                        .{ short.?, context1, field.name, context2, flag2.field_name }
+                    "Short flag conflict: '{s}' is used by both '{s}.{s}' and '{s}.{s}'",
+                    .{ short.?, ctx1, field.name, ctx2, flag.field_name }
                 ));
             }
 
-            if (long != null and flag2.long != null and mem.eql(u8, long.?, flag2.long.?)) {
-                const context1 = if (context.len == 0) "root" else context;
-                const context2 = if (flag2.context.len == 0) "root" else flag2.context;
+            if (long != null and flag.long != null and mem.eql(u8, long.?, flag.long.?)) {
                 @compileError(std.fmt.comptimePrint(
-                        "Long flag conflict: '{s}' is used by both '{s}.{s}' and '{s}.{s}'",
-                        .{ long.?, context1, field.name, context2, flag2.field_name }
+                    "Long flag conflict: '{s}' is used by both '{s}.{s}' and '{s}.{s}'",
+                    .{ long.?, ctx1, field.name, ctx2, flag.field_name }
                 ));
             }
         }
@@ -476,21 +440,32 @@ fn ArgStruct(comptime T: anytype) type {
         @compileError(@typeName(T) ++ " is not a struct, args must be a struct type");
 
     const in_fields = info.@"struct".fields;
-    var fields: [in_fields.len]StructField = undefined;
+    var out_fields: [in_fields.len]StructField = undefined;
     for (in_fields, 0..) |f, i| {
         const arg_info = f.defaultValue().?;
-        comptime var t: type = arg_info.type;
+        var t: type = arg_info.type;
+        const t_info = @typeInfo(t);
+
         switch (arg_info.arg_type) {
-            .SubCommand => t = ArgStruct(arg_info.type),
+            .subcommand => switch (t_info) {
+                .optional => |op| t = ?ArgStruct(op.child),
+                else => t = ArgStruct(arg_info.type),
+            },
             else => {}
         }
 
-        // TODO: I'm relying on undefined to avoid using null
-        // and having to do extra checks everywhere, but...
-        // 0.15.1 handles undefined differently and we can
-        // no longer use this aweful trick
-        const default: t = undefined;
-        fields[i] = StructField{
+        const default: t = switch (t_info) {
+            .optional => null,
+            .@"bool" => false,
+            .@"struct" => switch (t) {
+                // hmm ??
+                // ArrayList => .empty,
+                else => undefined,
+            },
+            else => undefined,
+        };
+
+        out_fields[i] = StructField{
             .name = f.name,
             .type = t,
             .default_value_ptr = @ptrCast(&default),
@@ -501,13 +476,12 @@ fn ArgStruct(comptime T: anytype) type {
     return @Type(.{
         .@"struct" = .{
             .layout = .auto,
-            .fields = &fields,
+            .fields = &out_fields,
             .decls = &.{},
             .is_tuple = false,
         }
     });
 }
-
 
 pub const String = struct {
     inner: []const u8,
@@ -532,26 +506,26 @@ test Args {
     };
 
     const TestArgs = struct {
-        sub: SubCommand(SubCmd) = .{ .description = "A subcommand" },
+        sub: SubCommand(?SubCmd) = .{ .description = "A subcommand" },
         flag: Arg(bool) = .{ .short = "-b", .description = "A flag" },
-        value: Arg(String) = .{ .description = "a string file" },
+        value: Arg(?String) = .{ .description = "a string file" },
         num: Arg(?u32) = .{ .description = "a number" },
         float: Arg(?f16) = .{ .description = "a float" },
         variant: Arg(?TestEnum) = .{
             .short = "-o",
             .description = "A enum"
         },
-        multivalue: Arg([]u8) = .{
+        multivalue: Arg(?[]u8) = .{
             .short = "-m",
             .long = "--nums",
             .description = "Multiple values",
         },
-        multistring: Arg([]String) = .{
+        multistring: Arg(?[]String) = .{
             .short = "-e",
             .long = "--entries",
             .description = "Multiple strings",
         },
-        sized_array: Arg([3]u8) = .{
+        sized_array: Arg(?[3]u8) = .{
             .long = "--sized",
             .description = "A sized array of u8",
         },
@@ -561,7 +535,7 @@ test Args {
         args: []const u8,
         expected: struct {
             ?bool, // flag
-            ?[]const u8, // value
+            ?String, // value
             ?u32, // num
             ?f16, // float
             ?TestEnum, // variant
@@ -572,11 +546,11 @@ test Args {
     }{
         .{
             .args = "-v config.zig",
-            .expected = .{ false, "config.zig", null, null, null, null, null, null },
+            .expected = .{ false, .{ .inner = "config.zig" }, null, null, null, null, null, null },
         },
         .{
             .args = "-v config.zig --flag",
-            .expected = .{ true, "config.zig", null, null, null, null, null, null },
+            .expected = .{ true, .{ .inner = "config.zig" }, null, null, null, null, null, null },
         },
         .{
             .args = "--num 2147483648",
@@ -596,7 +570,7 @@ test Args {
         },
         .{
             .args = "-v config.zig --nums 1 2 3 --flag",
-            .expected = .{ true, "config.zig", null, null, null, &[_]u8{1, 2, 3}, null, null },
+            .expected = .{ true, .{ .inner = "config.zig" }, null, null, null, &[_]u8{1, 2, 3}, null, null },
         },
         .{
             .args = "--entries one two three",
@@ -613,7 +587,7 @@ test Args {
         .{
             .args = "--flag -v config.zig -n 1 --float 1.2 -o eq --nums 4 3 2 1 --entries one two three --sized 1 2 3",
             .expected = .{
-                true, "config.zig", 1, 1.2, .eq, &[_]u8{4, 3, 2, 1},
+                true, .{ .inner = "config.zig" }, 1, 1.2, .eq, &[_]u8{4, 3, 2, 1},
                 &[_]String{.{ .inner = "one" }, .{ .inner = "two" }, .{ .inner = "three" }},
                 [3]u8{1, 2, 3}
             },
@@ -632,8 +606,8 @@ test Args {
         const flag = t.expected.@"0";
         try std.testing.expectEqual(flag, args.flag);
 
-        const value = t.expected.@"1" orelse "";
-        try std.testing.expectEqualStrings(value, args.value.inner);
+        const value = t.expected.@"1";
+        try std.testing.expectEqualDeep(value, args.value);
 
         const num = t.expected.@"2";
         try std.testing.expectEqual(num, args.num);
@@ -644,18 +618,41 @@ test Args {
         const variant = t.expected.@"4";
         try std.testing.expectEqual(variant, args.variant);
 
-        const multivalue = t.expected.@"5" orelse &[_]u8{};
-        try std.testing.expectEqualSlices(u8, multivalue, args.multivalue);
+        const multivalue = t.expected.@"5";
+        try std.testing.expectEqualDeep(multivalue, args.multivalue);
 
-        const multistring = t.expected.@"6" orelse &[_]String{};
+        const multistring = t.expected.@"6";
         try std.testing.expectEqualDeep(multistring, args.multistring);
 
-        const sized_array = t.expected.@"7" orelse [3]u8{0, 0, 0};
+        const sized_array = t.expected.@"7";
         try std.testing.expectEqualDeep(sized_array, args.sized_array);
 
-        try std.testing.expect(!args.sub.init);
+        if (args.sub) |sub| try std.testing.expectEqual(sub.init, false);
     }
 }
+
+// test "required" {
+//     const allocator = std.testing.allocator;
+//     const TestArgs = struct {
+//         pos: Positional(String) = .{ .description = "A positional argument" },
+//     };
+
+//     const tests = [_]struct {
+//         args: []const u8,
+//     }{
+//         .{ .args = "" },
+//     };
+
+
+//     for (tests) |t| {
+//         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
+//         defer iter.deinit();
+
+//         var argz = Args(TestArgs).init(allocator);
+//         defer argz.deinit();
+//         try std.testing.expectError(error.MissingArgument, argz.parseWithIterator(&iter));
+//     }
+// }
 
 test "positional" {
     const allocator = std.testing.allocator;
@@ -708,7 +705,7 @@ test "subcommand" {
     };
 
     const TestArgs = struct {
-        sub: SubCommand(SubCmd) = .{ .description = "A subcommand" },
+        sub: SubCommand(?SubCmd) = .{ .description = "A subcommand" },
         flag: Arg(bool) = .{ .short = "-b", .description = "A flag" },
     };
 
@@ -731,7 +728,11 @@ test "subcommand" {
         const args = try argz.parseWithIterator(&iter);
 
         const sub_init = t.expected.@"0";
-        try std.testing.expectEqual(sub_init, args.sub.init);
+        if (args.sub) |s| {
+            try std.testing.expectEqual(sub_init, s.init);
+        } else {
+            try std.testing.expect(sub_init == false);
+        }
 
         const flag = t.expected.@"1";
         try std.testing.expectEqual(flag, args.flag);
@@ -749,8 +750,8 @@ test "multi subcommand" {
     };
 
     const TestArgs = struct {
-        sub: SubCommand(SubCmd1) = .{ .description = "A subcommand" },
-        sub2: SubCommand(SubCmd2) = .{ .description = "A subcommand" },
+        sub: SubCommand(?SubCmd1) = .{ .description = "A subcommand" },
+        sub2: SubCommand(?SubCmd2) = .{ .description = "A subcommand" },
         flag: Arg(bool) = .{ .short = "-b", .description = "A flag" },
     };
 
@@ -783,10 +784,18 @@ test "multi subcommand" {
         try std.testing.expectEqual(flag, args.flag);
 
         const sub_init1 = t.expected.@"1";
-        try std.testing.expectEqual(sub_init1, args.sub.init);
+        if (args.sub) |s| {
+            try std.testing.expectEqual(sub_init1, s.init);
+        } else {
+            try std.testing.expect(sub_init1 == false);
+        }
 
         const sub_init2 = t.expected.@"2";
-        try std.testing.expectEqual(sub_init2, args.sub2.init);
+        if (args.sub2) |s| {
+            try std.testing.expectEqual(sub_init2, s.init);
+        } else {
+            try std.testing.expect(sub_init2 == false);
+        }
     }
 }
 
@@ -798,7 +807,7 @@ test "positional subcommand" {
     };
 
     const TestArgs = struct {
-        sub: SubCommand(SubCmd) = .{ .description = "A subcommand" },
+        sub: SubCommand(?SubCmd) = .{ .description = "A subcommand" },
         flag: Arg(bool) = .{ .short = "-a", .description = "A flag" },
         flag2: Arg(bool) = .{ .short = "-b", .description = "A flag" },
     };
@@ -826,16 +835,75 @@ test "positional subcommand" {
         const args = try argz.parseWithIterator(&iter);
 
         const sub_pos = t.expected.@"0";
-        try std.testing.expectEqualStrings(sub_pos.inner, args.sub.pos.inner);
-
         const sub_init = t.expected.@"1";
-        try std.testing.expectEqual(sub_init, args.sub.init);
+        if (args.sub) |s| {
+            try std.testing.expectEqualStrings(sub_pos.inner, s.pos.inner);
+            try std.testing.expectEqualDeep(sub_init, s.init);
+        } else {
+            // try std.testing.expect(sub_pos); // undefined
+            try std.testing.expect(sub_init == false);
+        }
 
         const flag = t.expected.@"2";
         try std.testing.expectEqual(flag, args.flag);
 
         const flag2 = t.expected.@"3";
         try std.testing.expectEqual(flag2, args.flag2);
+    }
+}
+
+test "multivalue before subcommand" {
+    const allocator = std.testing.allocator;
+    const SubCmd = struct {
+        init: Arg(bool) = .{ .short = "-i", .description = "Initialize something" },
+    };
+
+    const TestArgs = struct {
+        multi: Arg([]String) = .{
+            .short = "-n",
+            .long = "--nums",
+            .description = "Multiple values",
+        },
+        sub: SubCommand(?SubCmd) = .{ .description = "A subcommand" },
+    };
+
+    const tests = [_]struct {
+        args: []const u8,
+        expected: struct { []String, bool },
+    }{
+        // this is a bit of an edge case, but want to test similarity to other arg parsers
+        // because we have a multi arg before the sub command, the sub command arg gets eaten
+        .{
+            .args = "-n one two three sub -i",
+            .expected = .{
+                @constCast(&[_]String{
+                .{ .inner = "one" },
+                .{ .inner = "two" },
+                .{ .inner = "three"},
+                .{ .inner = "sub"},
+                }), false
+            },
+        }
+    };
+
+
+    for (tests) |t| {
+        var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
+        defer iter.deinit();
+
+        var argz = Args(TestArgs).init(allocator);
+        defer argz.deinit();
+        const args = try argz.parseWithIterator(&iter);
+
+        const multi = t.expected.@"0";
+        try std.testing.expectEqualDeep(multi, args.multi);
+
+        const sub_init = t.expected.@"1";
+        if (args.sub) |s| {
+            try std.testing.expectEqualDeep(sub_init, s.init);
+        } else {
+            try std.testing.expect(sub_init == false);
+        }
     }
 }
 
