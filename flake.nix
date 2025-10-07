@@ -12,7 +12,7 @@
       let
         overlays = [
           (final: prev: {
-            zig = inputs.zig.packages.${prev.system}."master";
+            zig = inputs.zig.packages.${prev.system}."0.15.1";
           })
         ];
         pkgs = import nixpkgs {

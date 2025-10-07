@@ -1,4 +1,5 @@
 const std = @import("std");
+const ArrayList = std.ArrayList;
 
 const argz = @import("argz");
 const String = argz.String;
@@ -18,9 +19,10 @@ pub fn main() !void {
         two: argz.Arg([]u8) = .{ .description = "a u8 list" },
         three: argz.Arg(?String) = .{ .short = "-s", .description = "a string type" },
         four: argz.Arg(?Switch) = .{ .description = "an enum type" },
+        five: argz.Arg(ArrayList(String)) = .{ .short = "-d", .description = "a string type" },
     };
 
-    var cli = argz.Args(Args).init(allocator);
+    var cli = argz.Parse(Args).init(allocator);
     defer cli.deinit();
 
     const args = try cli.parse();
@@ -39,5 +41,10 @@ pub fn main() !void {
         std.debug.print("four: value '{s}' of type {s}\n", .{@tagName(s), @typeName(@TypeOf(s))});
     } else {
         std.debug.print("four: value 'null' of type {s}\n", .{@typeName(@TypeOf(args.four))});
+    }
+
+    std.debug.print("five: value with length: {d} of type {s}\n", .{args.five.items.len, @typeName(@TypeOf(args.five))});
+    for (args.five.items, 0..) |item, i| {
+        std.debug.print("  five[{d}] = '{s}'\n", .{i, item.inner});
     }
 }

@@ -55,7 +55,7 @@ pub fn SubCommand(comptime T: anytype) type {
     };
 }
 
-pub fn Args(A: anytype) type {
+pub fn Parse(A: anytype) type {
     return struct {
         const Self = @This();
         header: []const u8 = std.fmt.comptimePrint("Usage: {s} [options]", .{@typeName(A)}),
@@ -73,13 +73,13 @@ pub fn Args(A: anytype) type {
             self.arena.deinit();
         }
 
-        pub fn parse(self: *Self) !ArgStruct(A) {
+        pub fn parse(self: *Self) !Parsed(A) {
             var iter = ArgIterator.init();
             _ = iter.skip(); // skip the program name
             return try self.parseWithIterator(&iter);
         }
 
-        pub fn parseWithIterator(self: *Self, iter: anytype) !ArgStruct(A) {
+        pub fn parseWithIterator(self: *Self, iter: anytype) !Parsed(A) {
             if (!@hasDecl(@TypeOf(iter.*), "next"))
                 @compileError("Iterator must implement next");
 
@@ -93,9 +93,9 @@ pub fn Args(A: anytype) type {
             comptime flags: []const FlagInfo,
             comptime context: []const u8,
             iter: anytype,
-        ) !ArgStruct(T) {
+        ) !Parsed(T) {
             if (@typeInfo(T) != .@"struct") @compileError("commands must be a struct type");
-            var args: ArgStruct(T) = .{};
+            var args: Parsed(T) = .{};
             const fields = @typeInfo(T).@"struct".fields;
             var pos_index: usize = 0;
 
@@ -119,7 +119,23 @@ pub fn Args(A: anytype) type {
                     const arg_info = f.defaultValue().?;
                     if (arg_info.eql(f.name, token)) {
                         switch (arg_info.arg_type) {
-                            .arg => @field(args, f.name) = try self.readType(arg_info.type, null, iter),
+                            .arg => switch (arg_info.type) {
+                                ?ArrayList(String) => {
+                                    const value = try self.readType(String, null, iter);
+                                    if (@field(args, f.name)) |*list| {
+                                        try list.append(self.arena.allocator(), value);
+                                    } else {
+                                        @field(args, f.name) = .empty;
+                                        try @field(args, f.name).?.append(self.arena.allocator(), value);
+                                    }
+                                },
+                                ArrayList(String) => {
+                                    const value = try self.readType(String, null, iter);
+                                    try @field(args, f.name).append(self.arena.allocator(), value);
+                                },
+                                else => @field(args, f.name) =
+                                    try self.readType(arg_info.type, null, iter),
+                            },
                             .positional => unreachable,
                             .subcommand => {
                                 const sub_context = if (context.len == 0) f.name else context ++ "." ++ f.name;
@@ -489,10 +505,13 @@ fn validateFlags(comptime T: type, comptime context: []const u8) []const FlagInf
     return flags;
 }
 
-fn ArgStruct(comptime T: anytype) type {
+pub fn Parsed(comptime T: anytype) type {
     const info = @typeInfo(T);
-    if (info != .@"struct")
-        @compileError(@typeName(T) ++ " is not a struct, args must be a struct type");
+    if (info != .@"struct") {
+        @compileError(
+            @typeName(T) ++ " is not a struct, args must be a struct type"
+        );
+    }
 
     const in_fields = info.@"struct".fields;
     var out_fields: [in_fields.len]StructField = undefined;
@@ -503,8 +522,8 @@ fn ArgStruct(comptime T: anytype) type {
 
         switch (arg_info.arg_type) {
             .subcommand => switch (t_info) {
-                .optional => |op| t = ?ArgStruct(op.child),
-                else => t = ArgStruct(arg_info.type),
+                .optional => |op| t = ?Parsed(op.child),
+                else => t = Parsed(arg_info.type),
             },
             else => {}
         }
@@ -517,8 +536,7 @@ fn ArgStruct(comptime T: anytype) type {
                 .one, .many, .c => @compileError("only slice pointer types are supported"),
             },
             .@"struct" => switch (t) {
-                // hmm ??
-                // ArrayList => .empty,
+                ArrayList(String) => .empty,
                 else => undefined,
             },
             else => undefined,
@@ -553,7 +571,7 @@ const ArgError = error{
     MissingRequiredArgument,
 };
 
-test Args {
+test Parse {
     const allocator = std.testing.allocator;
     const TestEnum = enum {
         less,
@@ -659,7 +677,7 @@ test Args {
         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
         defer iter.deinit();
 
-        var argz = Args(TestArgs).init(allocator);
+        var argz = Parse(TestArgs).init(allocator);
         defer argz.deinit();
         const args = try argz.parseWithIterator(&iter);
 
@@ -700,7 +718,7 @@ test "required" {
     var iter = try process.ArgIteratorGeneral(.{}).init(allocator, "");
     defer iter.deinit();
 
-    var argz = Args(TestArgs).init(allocator);
+    var argz = Parse(TestArgs).init(allocator);
     defer argz.deinit();
     try std.testing.expectError(error.MissingRequiredArgument, argz.parseWithIterator(&iter));
 }
@@ -718,7 +736,7 @@ test "required subcommand" {
     var iter = try process.ArgIteratorGeneral(.{}).init(allocator, "");
     defer iter.deinit();
 
-    var argz = Args(TestArgs).init(allocator);
+    var argz = Parse(TestArgs).init(allocator);
     defer argz.deinit();
     try std.testing.expectError(error.MissingRequiredArgument, argz.parseWithIterator(&iter));
 }
@@ -739,7 +757,7 @@ test "required with context" {
     {
         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, "");
         defer iter.deinit();
-        var argz = Args(TestArgs).init(allocator);
+        var argz = Parse(TestArgs).init(allocator);
         defer argz.deinit();
         _ = try argz.parseWithIterator(&iter);
     }
@@ -747,7 +765,7 @@ test "required with context" {
     {
         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, "sub");
         defer iter.deinit();
-        var argz = Args(TestArgs).init(allocator);
+        var argz = Parse(TestArgs).init(allocator);
         defer argz.deinit();
         try std.testing.expectError(error.MissingRequiredArgument, argz.parseWithIterator(&iter));
     }
@@ -755,7 +773,7 @@ test "required with context" {
     {
         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, "sub 42");
         defer iter.deinit();
-        var argz = Args(TestArgs).init(allocator);
+        var argz = Parse(TestArgs).init(allocator);
         defer argz.deinit();
         const args = try argz.parseWithIterator(&iter);
         try std.testing.expect(args.sub != null);
@@ -777,6 +795,7 @@ test "positional" {
     }{
         .{ .args = "one", .expected = .{ .{ .inner = "one" }, null, false } },
         .{ .args = "one two", .expected = .{  .{ .inner = "one" }, .{ .inner = "two" }, false } },
+        .{ .args = "one -f two", .expected = .{  .{ .inner = "one" }, .{ .inner = "two" }, true } },
         .{ .args = "one -f", .expected = .{ .{ .inner = "one" }, null, true } },
         .{ .args = "-f one", .expected = .{ .{ .inner = "one" }, null, true } },
     };
@@ -786,7 +805,7 @@ test "positional" {
         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
         defer iter.deinit();
 
-        var argz = Args(TestArgs).init(allocator);
+        var argz = Parse(TestArgs).init(allocator);
         defer argz.deinit();
         const args = try argz.parseWithIterator(&iter);
 
@@ -830,7 +849,7 @@ test "subcommand" {
         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
         defer iter.deinit();
 
-        var argz = Args(TestArgs).init(allocator);
+        var argz = Parse(TestArgs).init(allocator);
         defer argz.deinit();
         const args = try argz.parseWithIterator(&iter);
 
@@ -843,6 +862,64 @@ test "subcommand" {
 
         const flag = t.expected.@"1";
         try std.testing.expectEqual(flag, args.flag);
+    }
+}
+
+test "nullable multi occurance" {
+    const allocator = std.testing.allocator;
+    const TestArgs = struct {
+        strings: Arg(?ArrayList(String)) = .{ .description = "A list" },
+    };
+
+    var list: ArrayList(String) = .empty;
+    for (1..4) |i| {
+        const string = try std.fmt.allocPrint(allocator, "string-{d}", .{i});
+        try list.append(allocator, .{ .inner = string });
+    }
+    defer {
+        for (list.items) |*i| allocator.free(i.inner);
+        list.deinit(allocator);
+    }
+
+    const cmd_line_utf8 = "-s string-1 -s string-2 -s string-3";
+    var iter = try process.ArgIteratorGeneral(.{}).init(allocator, cmd_line_utf8);
+    defer iter.deinit();
+
+    var argz = Parse(TestArgs).init(allocator);
+    defer argz.deinit();
+    const args = try argz.parseWithIterator(&iter);
+
+    for (list.items, 0..) |item, i| {
+        try std.testing.expectEqualStrings(item.inner, args.strings.?.items[i].inner);
+    }
+}
+
+test "multi occurance" {
+    const allocator = std.testing.allocator;
+    const TestArgs = struct {
+        strings: Arg(ArrayList(String)) = .{ .description = "A list" },
+    };
+
+    var list: ArrayList(String) = .empty;
+    for (1..4) |i| {
+        const string = try std.fmt.allocPrint(allocator, "string-{d}", .{i});
+        try list.append(allocator, .{ .inner = string });
+    }
+    defer {
+        for (list.items) |*i| allocator.free(i.inner);
+        list.deinit(allocator);
+    }
+
+    const cmd_line_utf8 = "-s string-1 -s string-2 -s string-3";
+    var iter = try process.ArgIteratorGeneral(.{}).init(allocator, cmd_line_utf8);
+    defer iter.deinit();
+
+    var argz = Parse(TestArgs).init(allocator);
+    defer argz.deinit();
+    const args = try argz.parseWithIterator(&iter);
+
+    for (list.items, 0..) |item, i| {
+        try std.testing.expectEqualStrings(item.inner, args.strings.items[i].inner);
     }
 }
 
@@ -883,7 +960,7 @@ test "multi subcommand" {
         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
         defer iter.deinit();
 
-        var argz = Args(TestArgs).init(allocator);
+        var argz = Parse(TestArgs).init(allocator);
         defer argz.deinit();
         const args = try argz.parseWithIterator(&iter);
 
@@ -937,7 +1014,7 @@ test "positional subcommand" {
         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
         defer iter.deinit();
 
-        var argz = Args(TestArgs).init(allocator);
+        var argz = Parse(TestArgs).init(allocator);
         defer argz.deinit();
         const args = try argz.parseWithIterator(&iter);
 
@@ -947,7 +1024,7 @@ test "positional subcommand" {
             try std.testing.expectEqualStrings(sub_pos.inner, s.pos.inner);
             try std.testing.expectEqualDeep(sub_init, s.init);
         } else {
-            // try std.testing.expect(sub_pos); // undefined
+            try std.testing.expect(args.sub == null);
             try std.testing.expect(sub_init == false);
         }
 
@@ -998,7 +1075,7 @@ test "multivalue before subcommand" {
         var iter = try process.ArgIteratorGeneral(.{}).init(allocator, t.args);
         defer iter.deinit();
 
-        var argz = Args(TestArgs).init(allocator);
+        var argz = Parse(TestArgs).init(allocator);
         defer argz.deinit();
         const args = try argz.parseWithIterator(&iter);
 
@@ -1033,7 +1110,7 @@ test "help text" {
     var buf: [4096]u8 = undefined;
     var writer: std.io.Writer = .fixed(&buf);
 
-    var argz = Args(TestArgs).init(allocator);
+    var argz = Parse(TestArgs).init(allocator);
     defer argz.deinit();
 
     argz.writer = &writer;
@@ -1071,7 +1148,7 @@ test "help text with subcommands" {
     var buf: [4096]u8 = undefined;
     var writer: std.io.Writer = .fixed(&buf);
 
-    var argz = Args(TestArgs).init(allocator);
+    var argz = Parse(TestArgs).init(allocator);
     defer argz.deinit();
 
     argz.writer = &writer;
