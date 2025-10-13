@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const example = b.addExecutable(.{
         .name = "argz-example",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("example/cli.zig"),
+            .root_source_file = b.path("examples/cli.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     const help_demo = b.addExecutable(.{
         .name = "help-demo",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("example/help_demo.zig"),
+            .root_source_file = b.path("examples/help_demo.zig"),
             .target = target,
             .optimize = optimize,
         }),

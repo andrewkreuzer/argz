@@ -19,7 +19,7 @@ pub fn main() !void {
         sub: argz.SubCommand(SubCmd) = .{ .description = "Initialize subcommand" },
     };
 
-    var cli = argz.Args(Args).init(allocator);
+    var cli = argz.Parse(Args).init(allocator);
     defer cli.deinit();
 
     try cli.printHelp();
